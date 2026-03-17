@@ -79,7 +79,7 @@ jobs:
           unzip -q android-ndk-${NDK_VERSION}-linux.zip
           echo "ANDROID_NDK_ROOT=$(pwd)/android-ndk-${NDK_VERSION}" >> $GITHUB_ENV
 
-      - name: Build Android Binaries
+      - name: Build Android Server with NDK
         run: |
           # Define NDK toolchain paths
           TOOLCHAIN=$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64
@@ -88,20 +88,20 @@ jobs:
           # aarch64
           make clean
           CC=$TOOLCHAIN/bin/aarch64-linux-android$API-clang \
-          make build/andro
-          mv build/andro dist/nativeb-andro-aarch64
+          make build/nativeb_server
+          mv build/nativeb_server dist/nativeb-server-android-aarch64
 
           # armv7
           make clean
           CC=$TOOLCHAIN/bin/armv7a-linux-androideabi$API-clang \
-          make build/andro
-          mv build/andro dist/nativeb-andro-armv7
+          make build/nativeb_server
+          mv build/nativeb_server dist/nativeb-server-android-armv7
 
           # x86
           make clean
           CC=$TOOLCHAIN/bin/i686-linux-android$API-clang \
-          make build/andro
-          mv build/andro dist/nativeb-andro-x86
+          make build/nativeb_server
+          mv build/nativeb_server dist/nativeb-server-android-x86
 
       - name: Generate Changelog
         uses: orhun/git-cliff-action@v4
