@@ -46,7 +46,7 @@ jobs:
       - name: Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf
+          sudo apt-get install -y build-essential gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf gcc-i686-linux-gnu
 
       - name: Build Linux Server & MCP
         run: |
@@ -72,36 +72,22 @@ jobs:
           mv build/nativeb_server dist/nativeb-server-linux-armv7
           mv build/nativeb_mcp dist/nativeb-mcp-linux-armv7
 
-      - name: Install Android NDK
+      - name: Build Android Binaries
         run: |
-          NDK_VERSION="r25c"
-          wget --no-verbose https://dl.google.com/android/repository/android-ndk-${NDK_VERSION}-linux.zip
-          unzip -q android-ndk-${NDK_VERSION}-linux.zip
-          echo "ANDROID_NDK_ROOT=$(pwd)/android-ndk-${NDK_VERSION}" >> $GITHUB_ENV
-
-      - name: Build Android Server with NDK
-        run: |
-          # Define NDK toolchain paths
-          TOOLCHAIN=$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64
-          API=24
-
           # aarch64
           make clean
-          CC=$TOOLCHAIN/bin/aarch64-linux-android$API-clang \
-          make build/nativeb_server
-          mv build/nativeb_server dist/nativeb-server-android-aarch64
+          CC=aarch64-linux-gnu-gcc make build/andro
+          mv build/andro dist/nativeb-andro-aarch64
 
           # armv7
           make clean
-          CC=$TOOLCHAIN/bin/armv7a-linux-androideabi$API-clang \
-          make build/nativeb_server
-          mv build/nativeb_server dist/nativeb-server-android-armv7
+          CC=arm-linux-gnueabihf-gcc make build/andro
+          mv build/andro dist/nativeb-andro-armv7
 
           # x86
           make clean
-          CC=$TOOLCHAIN/bin/i686-linux-android$API-clang \
-          make build/nativeb_server
-          mv build/nativeb_server dist/nativeb-server-android-x86
+          CC=i686-linux-gnu-gcc make build/andro
+          mv build/andro dist/nativeb-andro-x86
 
       - name: Generate Changelog
         uses: orhun/git-cliff-action@v4
