@@ -269,7 +269,7 @@ int main() {
         }
         else if (strcmp(method, "tools/list") == 0) {
             printf("{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"tools\":["
-                "{\"name\":\"device_exec\",\"description\":\"Execute shell command on Android Host. Supports quoted arguments.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"cmd\":{\"type\":\"string\"}},\"required\":[\"cmd\"]}},"
+                "{\"name\":\"device_exec\",\"description\":\"Execute shell command on Android Host. IMPORTANT: Always use single quotes ('') for regex/complex arguments instead of double quotes to avoid JSON escape corruption (e.g. grep -E 'A|B'). Subshells like $(cmd) are fully supported.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"cmd\":{\"type\":\"string\"},\"timeout\":{\"type\":\"integer\",\"description\":\"Timeout in seconds (optional)\"}},\"required\":[\"cmd\"]}},"
                 "{\"name\":\"device_tap\",\"description\":\"Tap screen at (x, y).\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"x\":{\"type\":\"integer\"},\"y\":{\"type\":\"integer\"}},\"required\":[\"x\",\"y\"]}},"
                 "{\"name\":\"device_swipe\",\"description\":\"Swipe screen (x1,y1) to (x2,y2).\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"x1\":{\"type\":\"integer\"},\"y1\":{\"type\":\"integer\"},\"x2\":{\"type\":\"integer\"},\"y2\":{\"type\":\"integer\"}},\"required\":[\"x1\",\"y1\",\"x2\",\"y2\"]}},"
                 "{\"name\":\"device_ping\",\"description\":\"Check daemon connection.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}},"
@@ -292,9 +292,24 @@ int main() {
             } 
             else if (strcmp(tool_name, "device_exec") == 0) {
                 char cmd_str[2048] = {0};
-                extract_json_string(line, "cmd", cmd_str, sizeof(cmd_str));
+                char timeout_str[16] = {0};
+                char final_cmd[2500] = {0};
                 
-                // Extract first token for security check
+                extract_json_string(line, "cmd", cmd_str, sizeof(cmd_str));
+
+                // Handle timeout wrapper
+                if (extract_json_string(line, "timeout", timeout_str, sizeof(timeout_str))) {
+                    int t = atoi(timeout_str);
+                    if (t > 0) {
+                        snprintf(final_cmd, sizeof(final_cmd), "timeout %d %s", t, cmd_str);
+                    } else {
+                        strcpy(final_cmd, cmd_str);
+                    }
+                } else {
+                    strcpy(final_cmd, cmd_str);
+                }
+
+                // Extract first token from ORIGINAL cmd for security check
                 char first_token[256] = {0};
                 char* p = cmd_str;
                 while (*p && isspace((unsigned char)*p)) p++;
@@ -307,9 +322,9 @@ int main() {
                     exec_res = -1;
                     snprintf(raw_output, sizeof(raw_output), "Security Error: Command '%s' is blacklisted in MCP mode.", first_token);
                 } else {
-                    // Send raw command as a single null-terminated token to trigger 'sh -c' on server
+                    // Send wrapped command (with timeout if specified)
                     // Use CMD_STREAM for better handling of large outputs
-                    exec_res = run_bridge_command(CMD_STREAM, cmd_str, strlen(cmd_str) + 1, raw_output, sizeof(raw_output));
+                    exec_res = run_bridge_command(CMD_STREAM, final_cmd, strlen(final_cmd) + 1, raw_output, sizeof(raw_output));
                 }
             }
             else if (strcmp(tool_name, "device_tap") == 0) {
@@ -362,7 +377,8 @@ int main() {
                 char path[512] = {0};
                 extract_json_string(line, "path", path, sizeof(path));
                 char cmd[1024];
-                snprintf(cmd, sizeof(cmd), "cat \"%s\"", path);
+                // Execute cat with safe format and capture stderr for error reporting
+                snprintf(cmd, sizeof(cmd), "cat \"%s\" 2>&1", path);
                 exec_res = run_bridge_command(CMD_STREAM, cmd, strlen(cmd) + 1, raw_output, sizeof(raw_output));
             }
             else {
