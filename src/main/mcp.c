@@ -244,7 +244,7 @@ int main() {
     fprintf(stderr, "[MCP] Native-Bridge MCP Server Ready (Safe Mode)\n");
 
     char line[65536]; // Large input buffer to accommodate long JSON
-    char* escaped_output = malloc(131072);
+    char* escaped_output = malloc(2097152);
     if (!escaped_output) return 1;
     
     while (fgets(line, sizeof(line), stdin)) {
@@ -273,7 +273,7 @@ int main() {
                 "{\"name\":\"device_tap\",\"description\":\"Tap screen at (x, y).\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"x\":{\"type\":\"integer\"},\"y\":{\"type\":\"integer\"}},\"required\":[\"x\",\"y\"]}},"
                 "{\"name\":\"device_swipe\",\"description\":\"Swipe screen (x1,y1) to (x2,y2).\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"x1\":{\"type\":\"integer\"},\"y1\":{\"type\":\"integer\"},\"x2\":{\"type\":\"integer\"},\"y2\":{\"type\":\"integer\"}},\"required\":[\"x1\",\"y1\",\"x2\",\"y2\"]}},"
                 "{\"name\":\"device_ping\",\"description\":\"Check daemon connection.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}},"
-                "{\"name\":\"device_screenshot\",\"description\":\"Take screenshot (returns base64).\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}},"
+                "{\"name\":\"device_screenshot\",\"description\":\"Take a screenshot. Returns an image the AI can view.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}},"
                 "{\"name\":\"device_input_text\",\"description\":\"Inject text input.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\"}},\"required\":[\"text\"]}},"
                 "{\"name\":\"device_logcat\",\"description\":\"Fetch recent logcat.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"lines\":{\"type\":\"integer\"},\"filter\":{\"type\":\"string\"}},\"required\":[\"lines\"]}},"
                 "{\"name\":\"device_file_read\",\"description\":\"Read file directly.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}}"
@@ -283,7 +283,7 @@ int main() {
             char tool_name[64] = {0};
             extract_json_string(line, "name", tool_name, sizeof(tool_name));
 
-            char raw_output[65536] = {0}; 
+            static char raw_output[1048576];
             int exec_res = 0;
 
             // --- EXECUTE TOOL ---
@@ -350,8 +350,29 @@ int main() {
                 if (exec_res == 0) strcpy(raw_output, "Swipe OK");
             }
             else if (strcmp(tool_name, "device_screenshot") == 0) {
-                char* cmd = "screencap -p | base64 -w 0";
-                exec_res = run_bridge_command(CMD_STREAM, cmd, strlen(cmd) + 1, raw_output, sizeof(raw_output));
+                char* screenshot_buf = malloc(5242880); // 5 MB dedicated buffer
+                if (!screenshot_buf) {
+                    exec_res = -1;
+                    snprintf(raw_output, sizeof(raw_output), "Error: Out of memory for screenshot buffer.");
+                } else {
+                    char* cmd = "screencap -p | base64 -w 0";
+                    exec_res = run_bridge_command(CMD_STREAM, cmd, strlen(cmd) + 1, screenshot_buf, 5242880);
+                    if (exec_res == 0) {
+                        // Strip trailing newline/carriage-return (GNU base64 -w 0 appends \n)
+                        size_t ss_len = strlen(screenshot_buf);
+                        while (ss_len > 0 && (screenshot_buf[ss_len-1] == '\n' || screenshot_buf[ss_len-1] == '\r'))
+                            screenshot_buf[--ss_len] = '\0';
+                        ss_len = strlen(screenshot_buf); // re-measure after strip
+
+                        if (ss_len >= sizeof(raw_output) - 1) {
+                            exec_res = -1;
+                            snprintf(raw_output, sizeof(raw_output), "Error: Screenshot too large (%zu bytes).", ss_len);
+                        } else {
+                            strcpy(raw_output, screenshot_buf);
+                        }
+                    }
+                    free(screenshot_buf);
+                }
             }
             else if (strcmp(tool_name, "device_input_text") == 0) {
                 char text[1024] = {0};
@@ -387,13 +408,16 @@ int main() {
             }
 
             // --- SEND RESPONSE ---
-            escape_json_string(raw_output, escaped_output, 131072);
-            
-            // Correct JSON-RPC Response Format
-            if (exec_res != 0) {
+            if (strcmp(tool_name, "device_screenshot") == 0 && exec_res == 0) {
+                // Return as image content type for vision-capable AI models
+                escape_json_string(raw_output, escaped_output, 2097152);
+                printf("{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"content\":[{\"type\":\"image\",\"mimeType\":\"image/png\",\"data\":\"%s\"}]}}\n", id, escaped_output);
+            } else if (exec_res != 0) {
                 // MCP allows return text in isError true
+                escape_json_string(raw_output, escaped_output, 2097152);
                 printf("{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"isError\":true,\"content\":[{\"type\":\"text\",\"text\":\"%s\"}]}}\n", id, escaped_output);
             } else {
+                escape_json_string(raw_output, escaped_output, 2097152);
                 printf("{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"%s\"}]}}\n", id, escaped_output);
             }
         }
