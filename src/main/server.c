@@ -264,7 +264,17 @@ int main(int argc, char *argv[]) {
     }
     umask(old_mask);
 
-    // Ensure the socket is accessible (rw-rw-rw-)
+    // Socket permissions: 0666 (rw-rw-rw-)
+    //
+    // WHY: The server runs as root on Android Host. Clients run as a non-root
+    // user inside a chroot. The chroot's user database is invisible to the
+    // Android kernel, so:
+    //   - 0660 fails: the chroot user isn't root or in root's group on Android
+    //   - SO_PEERCRED fails: UID namespaces differ between chroot and host
+    //   - Group chown fails: the group doesn't exist on Android's /etc/group
+    //
+    // The chroot IS the security boundary. Any process inside it is already
+    // trusted. See docs/ADR-001-socket-permissions.md for full analysis.
     if (chmod(socket_path, 0666) < 0) {
         perror("Failed to chmod socket");
     }
