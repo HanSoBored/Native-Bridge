@@ -17,13 +17,13 @@
 // -------------------------------------------------------------------
 static int json_eq(const char *json, jsmntok_t *tok, const char *s) {
     if (tok->type == JSMN_STRING && (int)strlen(s) == tok->end - tok->start &&
-        strncmp(json + tok->start, s, tok->end - tok->start) == 0) {
+        strncmp(json + tok->start, s, (size_t)(tok->end - tok->start)) == 0) {
         return 0;
     }
     return -1;
 }
 
-int extract_json_string(const char* json, const char* key, char* out, size_t max) {
+static int extract_json_string(const char* json, const char* key, char* out, size_t max) {
     jsmn_parser p;
     jsmntok_t t[128]; // Enough for MCP JSON-RPC
     jsmn_init(&p);
@@ -69,7 +69,7 @@ int extract_json_string(const char* json, const char* key, char* out, size_t max
 // JSON ESCAPING (FULL SUPPORT)
 // Handle control characters to make JSON valid
 // -------------------------------------------------------------------
-void escape_json_string(const char* src, char* dest, size_t max_dest) {
+static void escape_json_string(const char* src, char* dest, size_t max_dest) {
     size_t i = 0;
     while (*src && i < max_dest - 2) {
         unsigned char c = *src;
@@ -93,7 +93,7 @@ void escape_json_string(const char* src, char* dest, size_t max_dest) {
 // COMMUNICATION FUNCTION TO NATIVE-BRIDGE SERVER
 // Use memcpy instead of strcat for buffer safety
 // -------------------------------------------------------------------
-int run_bridge_command(CommandType type, const char* payload_data, int payload_len, char* output_buf, size_t max_out) {
+static int run_bridge_command(CommandType type, const char* payload_data, int payload_len, char* output_buf, size_t max_out) {
     const char* socket_path = getenv("BRIDGE_SOCKET");
     if (!socket_path) socket_path = DEFAULT_SOCKET_PATH;
 
@@ -121,7 +121,7 @@ int run_bridge_command(CommandType type, const char* payload_data, int payload_l
         return -1;
     }
     if (payload_len > 0) {
-        write_all(sockfd, payload_data, payload_len);
+        write_all(sockfd, payload_data, (size_t)payload_len);
     }
 
     // Read Response Loop
@@ -188,50 +188,14 @@ const char* BLACKLISTED_COMMANDS[] = {
     "rm", "mv", "cp", "sh", "su", "chmod", "chown", "kill", "reboot", "recovery", "bootloader", "dd"
 };
 
-int is_command_blocked(const char* cmd) {
+static int is_command_blocked(const char* cmd) {
     if (!cmd) return 1;
     for (size_t i = 0; i < sizeof(BLACKLISTED_COMMANDS) / sizeof(char*); i++) {
         if (strcmp(cmd, BLACKLISTED_COMMANDS[i]) == 0) return 1;
-        char* last_slash = strrchr(cmd, '/');
+        const char* last_slash = strrchr(cmd, '/');
         if (last_slash && strcmp(last_slash + 1, BLACKLISTED_COMMANDS[i]) == 0) return 1;
     }
     return 0;
-}
-
-// -------------------------------------------------------------------
-// QUOTE-AWARE TOKENIZER
-// Handles "quoted arguments" correctly for shell-like behavior
-// -------------------------------------------------------------------
-int tokenize_with_quotes(char* input, char* payload, int max_payload) {
-    int p_len = 0;
-    char* p = input;
-    
-    while (*p) {
-        // Skip whitespace
-        while (*p && isspace((unsigned char)*p)) p++;
-        if (!*p) break;
-        
-        char quote = 0;
-        if (*p == '"' || *p == '\'') {
-            quote = *p++;
-        }
-        
-        while (*p) {
-            if (quote) {
-                if (*p == quote) { p++; break; }
-            } else {
-                if (isspace((unsigned char)*p)) break;
-            }
-            
-            if (p_len < max_payload - 1) {
-                payload[p_len++] = *p++;
-            } else {
-                p++; // Just skip if payload full
-            }
-        }
-        payload[p_len++] = '\0'; // Null terminate this token
-    }
-    return p_len;
 }
 
 // -------------------------------------------------------------------
@@ -324,7 +288,7 @@ int main() {
                 } else {
                     // Send wrapped command (with timeout if specified)
                     // Use CMD_STREAM for better handling of large outputs
-                    exec_res = run_bridge_command(CMD_STREAM, final_cmd, strlen(final_cmd) + 1, raw_output, sizeof(raw_output));
+                    exec_res = run_bridge_command(CMD_STREAM, final_cmd, (int)(strlen(final_cmd) + 1), raw_output, sizeof(raw_output));
                 }
             }
             else if (strcmp(tool_name, "device_tap") == 0) {
@@ -356,7 +320,7 @@ int main() {
                     snprintf(raw_output, sizeof(raw_output), "Error: Out of memory for screenshot buffer.");
                 } else {
                     char* cmd = "screencap -p | base64 -w 0";
-                    exec_res = run_bridge_command(CMD_STREAM, cmd, strlen(cmd) + 1, screenshot_buf, 5242880);
+                    exec_res = run_bridge_command(CMD_STREAM, cmd, (int)(strlen(cmd) + 1), screenshot_buf, 5242880);
                     if (exec_res == 0) {
                         // Strip trailing newline/carriage-return (GNU base64 -w 0 appends \n)
                         size_t ss_len = strlen(screenshot_buf);
@@ -379,7 +343,7 @@ int main() {
                 extract_json_string(line, "text", text, sizeof(text));
                 char cmd[1200];
                 snprintf(cmd, sizeof(cmd), "input text \"%s\"", text);
-                exec_res = run_bridge_command(CMD_STREAM, cmd, strlen(cmd) + 1, raw_output, sizeof(raw_output));
+                exec_res = run_bridge_command(CMD_STREAM, cmd, (int)(strlen(cmd) + 1), raw_output, sizeof(raw_output));
             }
             else if (strcmp(tool_name, "device_logcat") == 0) {
                 char lines_str[16] = {0}, filter[128] = {0}, cmd[512] = {0};
@@ -392,7 +356,7 @@ int main() {
                 } else {
                     snprintf(cmd, sizeof(cmd), "logcat -d -t %d", lines);
                 }
-                exec_res = run_bridge_command(CMD_STREAM, cmd, strlen(cmd) + 1, raw_output, sizeof(raw_output));
+                exec_res = run_bridge_command(CMD_STREAM, cmd, (int)(strlen(cmd) + 1), raw_output, sizeof(raw_output));
             }
             else if (strcmp(tool_name, "device_file_read") == 0) {
                 char path[512] = {0};
@@ -400,7 +364,7 @@ int main() {
                 char cmd[1024];
                 // Execute cat with safe format and capture stderr for error reporting
                 snprintf(cmd, sizeof(cmd), "cat \"%s\" 2>&1", path);
-                exec_res = run_bridge_command(CMD_STREAM, cmd, strlen(cmd) + 1, raw_output, sizeof(raw_output));
+                exec_res = run_bridge_command(CMD_STREAM, cmd, (int)(strlen(cmd) + 1), raw_output, sizeof(raw_output));
             }
             else {
                 exec_res = -1;

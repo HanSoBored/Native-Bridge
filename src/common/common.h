@@ -24,7 +24,7 @@ static inline int write_all(int fd, const void *buf, size_t count) {
     while (bytes_written < count) {
         ssize_t res = write(fd, ptr + bytes_written, count - bytes_written);
         if (res <= 0) { if (errno == EINTR) continue; return -1; }
-        bytes_written += res;
+        bytes_written += (size_t)res;
     }
     return 0;
 }
@@ -35,7 +35,7 @@ static inline int read_all(int fd, void *buf, size_t count) {
     while (bytes_read < count) {
         ssize_t res = read(fd, ptr + bytes_read, count - bytes_read);
         if (res <= 0) { if (errno == EINTR) continue; return -1; }
-        bytes_read += res;
+        bytes_read += (size_t)res;
     }
     return 0;
 }

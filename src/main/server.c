@@ -7,6 +7,8 @@
 #include <sys/un.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <sys/signal.h>
+#include <stddef.h>
 #include <getopt.h>
 #include "common.h"
 #include "input.h"
@@ -22,7 +24,7 @@ typedef struct {
     int is_stderr;
 } StreamArg;
 
-void send_packet(ClientCtx* ctx, uint32_t type, const void* payload, uint32_t len) {
+static void send_packet(ClientCtx* ctx, uint32_t type, const void* payload, uint32_t len) {
     PacketHeader hdr = {type, len};
     pthread_mutex_lock(&ctx->mutex);
     write_all(ctx->sock, &hdr, sizeof(hdr));
@@ -30,19 +32,19 @@ void send_packet(ClientCtx* ctx, uint32_t type, const void* payload, uint32_t le
     pthread_mutex_unlock(&ctx->mutex);
 }
 
-void* stream_reader(void* arg) {
+static void* stream_reader(void* arg) {
     StreamArg* sa = (StreamArg*)arg;
     char buffer[4096];
     ssize_t n;
 
     while ((n = read(sa->fd, buffer, sizeof(buffer))) > 0) {
-        send_packet(sa->ctx, sa->is_stderr ? RESP_STREAM_ERR : RESP_STREAM_CHUNK, buffer, n);
+        send_packet(sa->ctx, sa->is_stderr ? RESP_STREAM_ERR : RESP_STREAM_CHUNK, buffer, (uint32_t)n);
     }
     close(sa->fd);
     return NULL;
 }
 
-void* handle_client(void* arg) {
+static void* handle_client(void* arg) {
     int client_sock = (int)(intptr_t)arg;
     ClientCtx ctx = { .sock = client_sock };
     pthread_mutex_init(&ctx.mutex, NULL);
@@ -62,7 +64,7 @@ void* handle_client(void* arg) {
 
     if (hdr.type == CMD_PING) {
         char* msg = "Pong!";
-        send_packet(&ctx, RESP_SUCCESS, msg, strlen(msg) + 1);
+        send_packet(&ctx, RESP_SUCCESS, msg, (uint32_t)(strlen(msg) + 1));
     }
     #ifdef DIRECT_INPUT
     else if (hdr.type == CMD_TAP && hdr.len == sizeof(PayloadTap)) {
@@ -79,7 +81,7 @@ void* handle_client(void* arg) {
     else if (hdr.type == CMD_EXEC || hdr.type == CMD_STREAM) {
         if (!payload || hdr.len == 0) {
             char* err = "Empty command.";
-            send_packet(&ctx, RESP_ERROR, err, strlen(err));
+            send_packet(&ctx, RESP_ERROR, err, (uint32_t)strlen(err));
             goto cleanup_mem;
         }
 
@@ -89,8 +91,8 @@ void* handle_client(void* arg) {
         while (ptr < payload + hdr.len && argc < 63) {
             args[argc++] = ptr;
             // Safe increment: don't scan past hdr.len
-            size_t max_scan = (payload + hdr.len) - ptr;
-            size_t token_len = strnlen(ptr, max_scan);
+            size_t max_scan = (size_t)((payload + (ptrdiff_t)hdr.len) - ptr);
+            size_t token_len = (ptr[max_scan - 1] == '\0') ? strlen(ptr) : max_scan - 1;
             ptr += token_len + 1;
         }
         args[argc] = NULL;
@@ -102,7 +104,7 @@ void* handle_client(void* arg) {
             if (hdr.type == CMD_STREAM) valid = 1; // Allow live logcat for stream
             if (!valid) {
                 char* err = "Use CMD_STREAM for live logcat. Only 'logcat -d' or '-c' allowed with CMD_EXEC.";
-                send_packet(&ctx, RESP_ERROR, err, strlen(err));
+                send_packet(&ctx, RESP_ERROR, err, (uint32_t)strlen(err));
                 goto cleanup_mem;
             }
         }
@@ -111,7 +113,7 @@ void* handle_client(void* arg) {
             int pipefd[2];
             if (pipe(pipefd) < 0) {
                 char* err = "Failed to create pipe";
-                send_packet(&ctx, RESP_ERROR, err, strlen(err));
+                send_packet(&ctx, RESP_ERROR, err, (uint32_t)strlen(err));
                 goto cleanup_mem;
             }
             pid_t pid = fork();
@@ -137,21 +139,22 @@ void* handle_client(void* arg) {
             close(pipefd[1]);
 
             char out[8192] = {0};
-            int total = 0, n;
-            while(total < sizeof(out)-1 && (n = read(pipefd[0], out + total, sizeof(out) - total - 1)) > 0) total += n;
+            int total = 0;
+            ssize_t n;
+            while(total < (int)sizeof(out)-1 && (n = read(pipefd[0], out + total, (size_t)((int)sizeof(out) - total - 1))) > 0) total += (int)n;
             close(pipefd[0]);
 
             int status; waitpid(pid, &status, 0);
             if (WIFEXITED(status) && WEXITSTATUS(status) == 0)
-                send_packet(&ctx, RESP_SUCCESS, out, total);
+                send_packet(&ctx, RESP_SUCCESS, out, (uint32_t)total);
             else
-                send_packet(&ctx, RESP_ERROR, out, total);
+                send_packet(&ctx, RESP_ERROR, out, (uint32_t)total);
 
         } else if (hdr.type == CMD_STREAM) {
             int pipe_out[2], pipe_err[2];
             if (pipe(pipe_out) < 0 || pipe(pipe_err) < 0) {
                 char* err = "Failed to create streaming pipes";
-                send_packet(&ctx, RESP_ERROR, err, strlen(err));
+                send_packet(&ctx, RESP_ERROR, err, (uint32_t)strlen(err));
                 goto cleanup_mem;
             }
             pid_t pid = fork();
@@ -194,7 +197,7 @@ cleanup_sock:
     return NULL;
 }
 
-void print_server_help(const char* prog_name) {
+static void print_server_help(const char* prog_name) {
     printf("Native-Bridge Server Daemon\n");
     printf("Usage: %s -s <socket_path> [-d <touch_device>]\n\n", prog_name);
     printf("Options:\n");

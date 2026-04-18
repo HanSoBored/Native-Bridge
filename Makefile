@@ -1,6 +1,10 @@
-CC ?= gcc
-# Gunakan flag ini untuk keamanan stack dan optimasi
-CFLAGS = -Wall -O2 -pthread -I$(SRCDIR)/common -fstack-protector-strong
+CC ?= clang
+# C23 standard with strict warnings and static analysis
+CFLAGS = -std=c23 -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wdouble-promotion \
+         -Wnull-dereference -Wformat=2 -Wstrict-prototypes -Wold-style-definition \
+         -Wmissing-prototypes -Wimplicit-fallthrough -Wvla \
+         -Werror=implicit-function-declaration -O2 -pthread \
+         -I$(SRCDIR)/common -fstack-protector-strong
 LDFLAGS ?= -static
 
 SRCDIR = src

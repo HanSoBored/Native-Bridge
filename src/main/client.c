@@ -9,13 +9,14 @@
 
 int sockfd;
 
-void intHandler(int dummy) {
+static void intHandler(int dummy) {
+    (void)dummy;
     printf("\nExiting...\n");
     if(sockfd > 0) close(sockfd);
     exit(0);
 }
 
-void print_help() {
+static void print_help(void) {
     printf("Native-Bridge Client\n");
     printf("Usage:\n");
     printf("  andro -e <cmd> [args...]\n");
@@ -61,10 +62,10 @@ int main(int argc, char *argv[]) {
         if (argc < 3) return 1;
         hdr.type = (strcmp(argv[1], "-e") == 0) ? CMD_EXEC : CMD_STREAM;
         for (int i = 2; i < argc; i++) {
-            int len = strlen(argv[i]);
+            size_t len = strlen(argv[i]);
             if (hdr.len + len + 1 > sizeof(payload)) break;
             strcpy(payload + hdr.len, argv[i]);
-            hdr.len += len + 1;
+            hdr.len += (uint32_t)(len + 1);
         }
     }
     else if (strcmp(argv[1], "tap") == 0) {
@@ -79,7 +80,7 @@ int main(int argc, char *argv[]) {
         hdr.type = CMD_SWIPE;
         PayloadSwipe swipe = {
             atoi(argv[2]), atoi(argv[3]), atoi(argv[4]), atoi(argv[5]),
-            (argc > 6) ? atoi(argv[6]) : 300
+            (uint64_t)((argc > 6) ? atoi(argv[6]) : 300)
         };
         memcpy(payload, &swipe, sizeof(swipe));
         hdr.len = sizeof(swipe);
