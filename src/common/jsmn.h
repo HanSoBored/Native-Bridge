@@ -346,7 +346,7 @@ JSMN_API int jsmn_parse(jsmn_parser *parser, const char *js, const size_t len,
         }
       }
       /* Error if unmatched closing bracket */
-      if (i == 0 && parser->toknext > 0) {
+      if ((int)i == -1 && parser->toknext > 0) {
         return JSMN_ERROR_INVAL;
       }
       for (; i-- > 0;) {
