@@ -1,12 +1,16 @@
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <ctype.h>
 #include <signal.h>
+#include <errno.h>
+#include <limits.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include "common.h"
+#include "screenshot.h"
 
 #define JSMN_STATIC
 #include "jsmn.h"
@@ -14,14 +18,15 @@
 #define DEFAULT_SOCKET_PATH "/tmp/bridge.sock"
 #define MAX_PACKAGE_NAME_LEN 200
 #define MAX_TIMEOUT_SECONDS 3600
-#define RAW_OUTPUT_SIZE         (5 * 1024 * 1024)  /* 5 MB */
+#define RAW_OUTPUT_SIZE         (12 * 1024 * 1024)  /* 12 MB */
 
-#define ESCAPED_OUTPUT_SIZE     (RAW_OUTPUT_SIZE * 2)  /* 10 MB */
+#define ESCAPED_OUTPUT_SIZE     (RAW_OUTPUT_SIZE * 2)  /* 24 MB */
 #define MAX_LINE_SIZE           65536               /* 64 KB */
 #define DEFAULT_SWIPE_DURATION_MS 300
 #define MAX_LOGCAT_LINES        10000
 #define MAX_COORDINATE          10000
 #define JSON_ESCAPED_UNICODE_LEN 6   /* strlen("\\u00XX") */
+#define SCREENSHOT_TARGET_WIDTH 720  /* downscale width for token savings */
 
 
 // -------------------------------------------------------------------
@@ -137,7 +142,10 @@ static size_t escape_json_string(const char* src, char* dest, size_t max_dest) {
                 dest[i++] = c;
             }
         } else {
-            // Buffer full — continue counting to report total needed
+            // Buffer full — continue counting to report total needed.
+            // Guard against SIZE_MAX overflow (theoretical on 32-bit with
+            // extreme inputs; in practice ESCAPED_OUTPUT_SIZE caps at ~24MB).
+            if (i > SIZE_MAX / 2) { i = SIZE_MAX; break; }
             i += needed;
         }
         src++;
@@ -415,6 +423,22 @@ static size_t strtrim_trailing(char* s) {
     return len;
 }
 
+/**
+ * Parse a positive integer parameter from a string, with clamping and default fallback.
+ * Returns the parsed value clamped to [min, max], or default_val on parse failure.
+ */
+static int parse_positive_int_param(const char* str, int default_val, int min_val, int max_val) {
+    if (!str || str[0] == '\0') return default_val;
+    char* endptr;
+    errno = 0;
+    long parsed = strtol(str, &endptr, 10);
+    if (*endptr != '\0' || endptr == str || parsed <= 0) return default_val;
+    if ((parsed == LONG_MAX || parsed == LONG_MIN) && errno == ERANGE) return default_val;
+    if (parsed > max_val) return max_val;
+    if (parsed < min_val) return min_val;
+    return (int)parsed;
+}
+
 // -------------------------------------------------------------------
 // JSON-RPC METHOD HANDLERS
 // -------------------------------------------------------------------
@@ -442,7 +466,12 @@ static void print_mcp_response_header(const char* id) {
     print_json_id(id);
 }
 
-static void handle_initialize(const char* id) {
+static void handle_initialize(const char* id, const char* line,
+                               char* escaped_output, size_t escaped_size,
+                               char* raw_output, size_t raw_output_size,
+                               int is_notification) {
+    (void)line; (void)escaped_output; (void)escaped_size;
+    (void)raw_output; (void)raw_output_size; (void)is_notification;
     print_mcp_response_header(id);
     printf(",\"result\":{\"protocolVersion\":\"2024-11-05\","
         "\"capabilities\":{\"tools\":{}},"
@@ -461,21 +490,22 @@ typedef struct {
     const char* input_schema;  /* JSON object string */
     const char* content_type;  /* "text" or "image" (NULL means "text") */
     const char* mime_type;     /* e.g. "image/png" (NULL for text) */
-    int (*handler)(const char*, char*, size_t);
+    int (*handler)(const char*, char*, size_t, void* ctx);
 } ToolDef;
 
 // Forward declarations of all tool handlers (used in TOOLS[] below)
-static int handle_device_exec(const char*, char*, size_t);
-static int handle_device_tap(const char*, char*, size_t);
-static int handle_device_swipe(const char*, char*, size_t);
-static int handle_device_ping(const char*, char*, size_t);
-static int handle_device_screenshot(const char*, char*, size_t);
-static int handle_device_input_text(const char*, char*, size_t);
-static int handle_device_logcat(const char*, char*, size_t);
-static int handle_device_file_read(const char*, char*, size_t);
-static int handle_device_app_open(const char*, char*, size_t);
-static int handle_device_app_close(const char*, char*, size_t);
-static int handle_device_app_list(const char*, char*, size_t);
+static int handle_device_exec(const char*, char*, size_t, void*);
+static int handle_device_tap(const char*, char*, size_t, void*);
+static int handle_device_swipe(const char*, char*, size_t, void*);
+static int handle_device_ping(const char*, char*, size_t, void*);
+static int handle_device_screenshot(const char*, char*, size_t, void*);
+static int handle_device_input_text(const char*, char*, size_t, void*);
+static int handle_device_logcat(const char*, char*, size_t, void*);
+static int handle_device_file_read(const char*, char*, size_t, void*);
+static int handle_device_app_open(const char*, char*, size_t, void*);
+static int handle_device_app_close(const char*, char*, size_t, void*);
+static int handle_device_app_list(const char*, char*, size_t, void*);
+static int handle_device_uiautomator(const char*, char*, size_t, void*);
 
 static const ToolDef TOOLS[] = {
     {"device_exec",
@@ -564,9 +594,31 @@ static const ToolDef TOOLS[] = {
      "(e.g. 'chrome')\"}}}",
      "text", NULL,
      handle_device_app_list},
-};
+    {"device_uiautomator",
+     "Dump Android UI hierarchy (via uiautomator) and filter elements. "
+     "Returns matching XML node lines. Much cheaper than screenshot. "
+     "If 'path' is provided: dump to that path and return raw unfiltered XML. "
+     "If 'path' is omitted: dump to /tmp, filter with grep + limit.",
+     "{\"type\":\"object\","
+     "\"properties\":{"
+       "\"query\":{\"type\":\"string\","
+         "\"description\":\"Search term. Empty/'*' shows all. Ignored if path is set.\"},"
+       "\"limit\":{\"type\":\"integer\","
+         "\"description\":\"Max lines (default 30, max 500). Ignored if path is set.\"},"
+       "\"path\":{\"type\":\"string\","
+         "\"description\":\"Custom dump path. When set, returns raw unfiltered XML.\"}"
+     "},"
+     "\"required\":[]}",
+     "text", NULL,
+     handle_device_uiautomator},
+ };
 
-static void handle_tools_list(const char* id) {
+static void handle_tools_list(const char* id, const char* line,
+                               char* escaped_output, size_t escaped_size,
+                               char* raw_output, size_t raw_output_size,
+                               int is_notification) {
+    (void)line; (void)escaped_output; (void)escaped_size;
+    (void)raw_output; (void)raw_output_size; (void)is_notification;
     size_t tool_count = sizeof(TOOLS) / sizeof(TOOLS[0]);
     print_mcp_response_header(id);
     printf(",\"result\":{\"tools\":[");
@@ -577,6 +629,20 @@ static void handle_tools_list(const char* id) {
     }
     printf("]}}\n");
 }
+
+// -------------------------------------------------------------------
+// METHOD DISPATCH TABLE TYPES
+// -------------------------------------------------------------------
+typedef void (*method_handler)(const char* id, const char* line,
+                                char* escaped_output, size_t escaped_size,
+                                char* raw_output, size_t raw_output_size,
+                                int is_notification);
+
+typedef struct {
+    const char* method;
+    int allow_notification;
+    method_handler fn;
+} MethodDef;
 
 // -------------------------------------------------------------------
 // RESPONSE FORMATTING HELPER
@@ -622,8 +688,8 @@ static void send_mcp_response(const char* id, const ToolDef* tool,
 // TOOL HANDLER IMPLEMENTATIONS
 // -------------------------------------------------------------------
 
-static int handle_device_ping(const char* json_line, char* output, size_t out_size) {
-    (void)json_line; // Unused
+static int handle_device_ping(const char* json_line, char* output, size_t out_size, void* ctx) {
+    (void)json_line; (void)ctx;
     return run_bridge_command(CMD_PING, "", 0, output, out_size);
 }
 
@@ -685,7 +751,8 @@ static int validate_cmd_safe(const char* cmd_str, char* output, size_t out_size)
     return 0;
 }
 
-static int handle_device_exec(const char* json_line, char* output, size_t out_size) {
+static int handle_device_exec(const char* json_line, char* output, size_t out_size, void* ctx) {
+    (void)ctx;
     char cmd_str[2048] = {0};
     char timeout_str[16] = {0};
     char final_cmd[2500] = {0};
@@ -705,7 +772,11 @@ static int handle_device_exec(const char* json_line, char* output, size_t out_si
         return -1;
     }
 
-    extract_json_string(json_line, "timeout", timeout_str, sizeof(timeout_str));
+    int ret_timeout = extract_json_string(json_line, "timeout", timeout_str, sizeof(timeout_str));
+    if (ret_timeout == -2) {
+        snprintf(output, out_size, "Error: 'timeout' value too long.");
+        return -1;
+    }
 
     // Validate original command before timeout wrapping (CERT STR02-C)
     if (validate_cmd_safe(cmd_str, output, out_size) != 0) return -1;
@@ -739,7 +810,8 @@ static int parse_coordinate(const char* json_line, const char* key,
     return 0;
 }
 
-static int handle_device_tap(const char* json_line, char* output, size_t out_size) {
+static int handle_device_tap(const char* json_line, char* output, size_t out_size, void* ctx) {
+    (void)ctx;
     int x = 0, y = 0;
     if (parse_coordinate(json_line, "x", &x, output, out_size) != 0) return -1;
     if (parse_coordinate(json_line, "y", &y, output, out_size) != 0) return -1;
@@ -750,7 +822,8 @@ static int handle_device_tap(const char* json_line, char* output, size_t out_siz
     return res;
 }
 
-static int handle_device_swipe(const char* json_line, char* output, size_t out_size) {
+static int handle_device_swipe(const char* json_line, char* output, size_t out_size, void* ctx) {
+    (void)ctx;
     PayloadSwipe s = {0};
     s.duration_ms = DEFAULT_SWIPE_DURATION_MS;
 
@@ -767,31 +840,70 @@ static int handle_device_swipe(const char* json_line, char* output, size_t out_s
     return res;
 }
 
-static int handle_device_screenshot(const char* json_line, char* output, size_t out_size) {
-    (void)json_line; // Unused
-    
-    // Note: Pipe is safe here because the command is hardcoded, not user-supplied.
-    // CMD_STREAM passes this to the bridge daemon's shell; the MCP server's
-    // metacharacter validator does not apply to hardcoded commands.
+/* Screenshot dimensions type — returned from handle_device_screenshot
+ * and consumed by send_screenshot_response for coordinate metadata. */
+typedef struct { int ow, oh, dw, dh; } ShotDims;
+
+static int handle_device_screenshot(const char* json_line, char* output, size_t out_size, void* ctx) {
+    (void)json_line;
+    ShotDims* shot = (ShotDims*)ctx;
+    /* Zero dimension struct to prevent stale-value usage on early return */
+    memset(shot, 0, sizeof(*shot));
+
+    // Step 1: Capture full-res screenshot as PNG base64
+    // NOTE: "screencap -p" is Android-specific; not available on
+    // non-Android Linux or other platforms. Also requires the
+    // "base64" utility (part of BusyBox/coreutils on Android).
     char* cmd = "screencap -p | base64 -w 0";
     int res = exec_stream_cmd(cmd, output, out_size);
-    if (res != 0) {
-        return res;
-    }
+    if (res != 0) return res;
 
-    // Strip trailing whitespace (GNU base64 -w 0 appends \n).
-    // Using strtrim_trailing to avoid a second strlen() on the ~1 MB buffer.
-    size_t ss_len = strtrim_trailing(output);
+    strtrim_trailing(output);
 
-    if (ss_len >= out_size - 1) {
-        snprintf(output, out_size, "Error: Screenshot too large (%zu bytes).", ss_len);
+    /* Step 2: Downscale to save tokens (default 720px width).
+     * Peak memory budget: ~12 MB (base64) + ~12 MB (orig copy) + ~50 MB (LodePNG RGBA)
+     * = ~74 MB. strdup is required because downscale_screenshot_base64 reads from
+     * the input pointer and writes to the output pointer, which cannot overlap. */
+    char* orig = strdup(output);
+    if (!orig) {
+        snprintf(output, out_size, "Error: Out of memory processing screenshot.");
         return -1;
     }
+
+    unsigned orig_w = 0, orig_h = 0;
+    if (downscale_screenshot_base64(orig, output, out_size,
+                                     SCREENSHOT_TARGET_WIDTH, &orig_w, &orig_h) != 0) {
+        // Fall back to full-res — warn so operators can detect when downscale fails
+        fprintf(stderr, "[MCP] Warning: screenshot downscale failed, "
+                        "falling back to full-resolution (%zu bytes of base64)\n",
+                        strlen(orig));
+        size_t orig_len = strlen(orig);
+        if (orig_len >= out_size) {
+            snprintf(output, out_size, "Error: Screenshot too large (%zu bytes).", orig_len);
+            free(orig);
+            return -1;
+        }
+        memcpy(output, orig, orig_len + 1);
+        free(orig);
+        return 0;
+    }
+    free(orig);
+
+    // Store dimensions for metadata in response
+    shot->ow = (int)orig_w;
+    shot->oh = (int)orig_h;
+    shot->dw = (orig_w > 0 && orig_w < SCREENSHOT_TARGET_WIDTH)
+                   ? (int)orig_w
+                   : SCREENSHOT_TARGET_WIDTH;
+    shot->dh = (orig_w > 0 && orig_h > 0)
+                   ? (int)((unsigned long long)shot->dw * orig_h / orig_w)
+                   : 0;
 
     return 0;
 }
 
-static int handle_device_input_text(const char* json_line, char* output, size_t out_size) {
+static int handle_device_input_text(const char* json_line, char* output, size_t out_size, void* ctx) {
+    (void)ctx;
     char text[1024] = {0};
     if (!extract_json_string(json_line, "text", text, sizeof(text))) {
         snprintf(output, out_size, "Error: 'text' parameter is required.");
@@ -816,23 +928,13 @@ static int validate_filter(const char* filter, char* output, size_t out_size) {
     return 0;
 }
 
-static int handle_device_logcat(const char* json_line, char* output, size_t out_size) {
+static int handle_device_logcat(const char* json_line, char* output, size_t out_size, void* ctx) {
+    (void)ctx;
     char lines_str[16] = {0}, filter[128] = {0}, cmd[512] = {0};
     extract_json_string(json_line, "lines", lines_str, sizeof(lines_str));
     extract_json_string(json_line, "filter", filter, sizeof(filter));
 
-    // Safe parsing with strtol — detect non-numeric input and overflow
-    char* endptr;
-    long parsed = strtol(lines_str, &endptr, 10);
-    // Clamp to valid range: 1..MAX_LOGCAT_LINES, default 100
-    int lines;
-    if (*endptr != '\0' || endptr == lines_str || parsed <= 0) {
-        lines = 100;  // default for empty/invalid
-    } else if (parsed > MAX_LOGCAT_LINES) {
-        lines = MAX_LOGCAT_LINES;  // cap to prevent resource exhaustion
-    } else {
-        lines = (int)parsed;
-    }
+    int lines = parse_positive_int_param(lines_str, 100, 1, MAX_LOGCAT_LINES);
     
     if (validate_filter(filter, output, out_size) != 0) return -1;
     if (strlen(filter) > 0) {
@@ -861,7 +963,8 @@ static int is_allowed_path_prefix(const char* path) {
     return 0;  // not allowed
 }
 
-static int handle_device_file_read(const char* json_line, char* output, size_t out_size) {
+static int handle_device_file_read(const char* json_line, char* output, size_t out_size, void* ctx) {
+    (void)ctx;
     char path[512] = {0};
     if (!extract_json_string(json_line, "path", path, sizeof(path))) {
         snprintf(output, out_size, "Error: 'path' parameter is required.");
@@ -932,7 +1035,8 @@ static int parse_activity_output(const char* output, char* activity,
     return 0;
 }
 
-static int handle_device_app_open(const char* json_line, char* output, size_t out_size) {
+static int handle_device_app_open(const char* json_line, char* output, size_t out_size, void* ctx) {
+    (void)ctx;
     char package[MAX_PACKAGE_NAME_LEN + 1] = {0};
     if (extract_and_validate_package(json_line, package, sizeof(package),
                                       output, out_size) != 0) return -1;
@@ -963,7 +1067,8 @@ static int handle_device_app_open(const char* json_line, char* output, size_t ou
     return res;
 }
 
-static int handle_device_app_close(const char* json_line, char* output, size_t out_size) {
+static int handle_device_app_close(const char* json_line, char* output, size_t out_size, void* ctx) {
+    (void)ctx;
     char package[MAX_PACKAGE_NAME_LEN + 1] = {0};
     if (extract_and_validate_package(json_line, package, sizeof(package),
                                       output, out_size) != 0) return -1;
@@ -977,7 +1082,8 @@ static int handle_device_app_close(const char* json_line, char* output, size_t o
     return res;
 }
 
-static int handle_device_app_list(const char* json_line, char* output, size_t out_size) {
+static int handle_device_app_list(const char* json_line, char* output, size_t out_size, void* ctx) {
+    (void)ctx;
     char app_filter[256] = {0};
     // filter is optional — tolerate missing key (zero-initialized is fine)
     int ret = extract_json_string(json_line, "filter", app_filter, sizeof(app_filter));
@@ -995,6 +1101,134 @@ static int handle_device_app_list(const char* json_line, char* output, size_t ou
 }
 
 // -------------------------------------------------------------------
+// DEVICE_UI_AUTOMATOR HANDLER
+// -------------------------------------------------------------------
+
+// Shared safe-string validator for uiautomator inputs.
+// Checks for path traversal (..) and disallowed characters.
+static int is_safe_string(const char* s, const char* extra_allowed,
+                          const char* err_name, char* output, size_t out_size) {
+    // Check for path traversal before character validation
+    if (strstr(s, "..") != NULL) {
+        snprintf(output, out_size,
+            "Error: %s contains '..' (path traversal not allowed).", err_name);
+        return -1;
+    }
+    for (size_t i = 0; s[i]; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (isalnum(c)) continue;
+        if (extra_allowed && strchr(extra_allowed, c)) continue;
+        snprintf(output, out_size,
+            "Error: %s contains disallowed character '%c'.", err_name, (char)c);
+        return -1;
+    }
+    return 0;
+}
+
+// Validate query: only alphanumeric + safe punctuation (shell-safe inside single quotes)
+static int is_uia_safe_query(const char* q, char* output, size_t out_size) {
+    return is_safe_string(q, " _-./:@=#+()*,", "query", output, out_size);
+}
+
+// Validate path: only alphanumeric + / _ - .
+static int is_uia_safe_path(const char* p, char* output, size_t out_size) {
+    if (strlen(p) == 0) {
+        snprintf(output, out_size, "Error: path must not be empty.");
+        return -1;
+    }
+    return is_safe_string(p, "/_.-", "path", output, out_size);
+}
+
+static int handle_uiautomator_raw_path(const char* path, char* output, size_t out_size) {
+    if (is_uia_safe_path(path, output, out_size) != 0) return -1;
+    char cmd[2048];
+    snprintf(cmd, sizeof(cmd),
+        "uiautomator dump '%s' 2>/dev/null && cat '%s' 2>/dev/null",
+        path, path);
+    fprintf(stderr, "[UIA] raw dump -> %s\n", path);
+    return exec_stream_cmd(cmd, output, out_size);
+}
+
+static int handle_uiautomator_filtered(const char* query, int limit,
+                                        char* output, size_t out_size) {
+    if (is_uia_safe_query(query, output, out_size) != 0) return -1;
+
+    char temp_path[] = "/tmp/nb_uia_XXXXXX.xml";
+    int temp_fd = mkstemp(temp_path);
+    if (temp_fd < 0) {
+        snprintf(output, out_size, "Error: failed to create temp file.");
+        return -1;
+    }
+    close(temp_fd);
+    char cmd[2048];
+    int n;
+    if (strlen(query) == 0 || strcmp(query, "*") == 0) {
+        n = snprintf(cmd, sizeof(cmd),
+            "uiautomator dump \"%s\" 2>&1 && "
+            "head -%d \"%s\"; "
+            "rm -f \"%s\"", temp_path, limit, temp_path, temp_path);
+    } else {
+        n = snprintf(cmd, sizeof(cmd),
+            "uiautomator dump \"%s\" 2>&1 && "
+            "grep -iF '%s' \"%s\" | head -%d; "
+            "rm -f \"%s\"", temp_path, query, temp_path, limit, temp_path);
+    }
+    if (n < 0 || (size_t)n >= sizeof(cmd)) {
+        unlink(temp_path);
+        snprintf(output, out_size, "Error: full command too long.");
+        return -1;
+    }
+
+    int ret = exec_stream_cmd(cmd, output, out_size);
+    unlink(temp_path);  /* clean up regardless of exec result (rm in cmd is best-effort) */
+    return ret;
+}
+
+static int handle_device_uiautomator(const char* json_line, char* output, size_t out_size, void* ctx) {
+    (void)ctx;
+    char path[512] = {0};
+    char query[256] = {0};
+    char limit_str[16] = {0};
+
+    int has_path = extract_json_string(json_line, "path", path, sizeof(path));
+    if (has_path && has_path != -2) {
+        return handle_uiautomator_raw_path(path, output, out_size);
+    }
+
+    if (has_path == -2) {
+        snprintf(output, out_size,
+                 "Error: 'path' too long (max %zu characters).",
+                 sizeof(path) - 1);
+        return -1;
+    }
+
+    // Extract query (required unless path is set)
+    int ret = extract_json_string(json_line, "query", query, sizeof(query));
+    if (ret == -2) {
+        snprintf(output, out_size,
+                 "Error: 'query' too long (max %zu characters).",
+                 sizeof(query) - 1);
+        return -1;
+    }
+    if (ret == 0) {
+        snprintf(output, out_size, "Error: 'query' parameter is required when path is not set.");
+        return -1;
+    }
+
+    // Extract limit
+    int has_limit = extract_json_string(json_line, "limit", limit_str, sizeof(limit_str));
+    if (has_limit == -2) {
+        snprintf(output, out_size,
+                 "Error: 'limit' too long (max %zu characters).",
+                 sizeof(limit_str) - 1);
+        return -1;
+    }
+    int limit = parse_positive_int_param(limit_str, 30, 1, 500);
+
+    return handle_uiautomator_filtered(query, limit, output, out_size);
+}
+
+// -------------------------------------------------------------------
 // TOOL DISPATCH HELPER (DATA-DRIVEN)
 // -------------------------------------------------------------------
 // Dispatches a tool call by name using the handler function pointer stored
@@ -1003,11 +1237,11 @@ static int handle_device_app_list(const char* json_line, char* output, size_t ou
 // The handler result is written to *out_result.
 static const ToolDef* dispatch_tool_call(const char* json_line, const char* tool_name,
                                          char* raw_output, size_t raw_output_size,
-                                         int* out_result) {
+                                         int* out_result, void* ctx) {
     size_t tool_count = sizeof(TOOLS) / sizeof(TOOLS[0]);
     for (size_t i = 0; i < tool_count; i++) {
         if (strcmp(tool_name, TOOLS[i].name) == 0) {
-            *out_result = TOOLS[i].handler(json_line, raw_output, raw_output_size);
+            *out_result = TOOLS[i].handler(json_line, raw_output, raw_output_size, ctx);
             return &TOOLS[i];
         }
     }
@@ -1017,10 +1251,91 @@ static const ToolDef* dispatch_tool_call(const char* json_line, const char* tool
 }
 
 // -------------------------------------------------------------------
-// PER-REQUEST DISPATCH (EXTRACTED FROM MAIN LOOP)
+// FORWARD DECLARATIONS
 // -------------------------------------------------------------------
-// Handles a single JSON-RPC request line. Extracts the method and id,
-// dispatches to the appropriate handler, and sends the response.
+static void send_screenshot_response(const char* id, int orig_w, int orig_h,
+                                     const char* raw_b64, char* escaped_buf, size_t escaped_size);
+
+// -------------------------------------------------------------------
+// METHOD HANDLER EXTRACTIONS (SRP — one function per JSON-RPC method)
+// -------------------------------------------------------------------
+
+static void handle_ping(const char* id, const char* line,
+                         char* escaped_output, size_t escaped_size,
+                         char* raw_output, size_t raw_output_size,
+                         int is_notification) {
+    (void)line; (void)escaped_output; (void)escaped_size;
+    (void)raw_output; (void)raw_output_size;
+    if (!is_notification) {
+        print_mcp_response_header(id);
+        printf(",\"result\":{}}\n");
+    }
+}
+
+static void handle_notifications_initialized(const char* id, const char* line,
+                                              char* escaped_output, size_t escaped_size,
+                                              char* raw_output, size_t raw_output_size,
+                                              int is_notification) {
+    (void)id; (void)line; (void)escaped_output; (void)escaped_size;
+    (void)raw_output; (void)raw_output_size; (void)is_notification;
+    /* No response needed per JSON-RPC 2.0 — always a notification */
+}
+
+static void handle_tools_call(const char* id, const char* line,
+                               char* escaped_output, size_t escaped_size,
+                               char* raw_output, size_t raw_output_size,
+                               int is_notification) {
+    (void)is_notification;
+    /* Notifications MUST NOT produce a response — handled by caller */
+    char tool_name[64] = {0};
+    extract_json_string(line, "name", tool_name, sizeof(tool_name));
+    ShotDims shot_dims = {0};
+    int exec_res;
+    const ToolDef* tool = dispatch_tool_call(line, tool_name,
+                                            raw_output, raw_output_size,
+                                            &exec_res, &shot_dims);
+    if (tool && strcmp(tool_name, "device_screenshot") == 0 && exec_res == 0) {
+        send_screenshot_response(id, shot_dims.dw, shot_dims.dh,
+                                 raw_output, escaped_output, escaped_size);
+    } else if (tool) {
+        send_mcp_response(id, tool, exec_res, raw_output,
+                         escaped_output, escaped_size);
+    } else {
+        send_mcp_response(id, &TOOLS[0], -1, raw_output,
+                         escaped_output, escaped_size);
+    }
+}
+
+static void handle_unknown_method(const char* id, const char* line,
+                                   char* escaped_output, size_t escaped_size,
+                                   char* raw_output, size_t raw_output_size,
+                                   int is_notification) {
+    (void)line; (void)escaped_output; (void)escaped_size;
+    (void)raw_output; (void)raw_output_size;
+    if (!is_notification) {
+        print_mcp_response_header(id);
+        printf(",\"result\":{\"isError\":true,\"content\":[{\"type\":\"text\","
+               "\"text\":\"Unknown method\"}]}}\n");
+    }
+}
+
+// -------------------------------------------------------------------
+// METHOD DISPATCH TABLE
+// -------------------------------------------------------------------
+static const MethodDef METHODS[] = {
+    {"initialize",              0, handle_initialize},
+    {"notifications/initialized", 1, handle_notifications_initialized},
+    {"ping",                    0, handle_ping},
+    {"tools/list",              0, handle_tools_list},
+    {"tools/call",              0, handle_tools_call},
+};
+
+// -------------------------------------------------------------------
+// PER-REQUEST DISPATCH (ORCHESTRATION ONLY)
+// -------------------------------------------------------------------
+// Handles a single JSON-RPC request line. Extracts method and id,
+// looks up in METHODS[] dispatch table, calls the appropriate handler.
+// Unknown methods fall through to handle_unknown_method.
 static void handle_mcp_request(const char* line, char* escaped_output, size_t escaped_size,
                                 char* raw_output, size_t raw_output_size) {
     char method[64] = {0};
@@ -1032,31 +1347,139 @@ static void handle_mcp_request(const char* line, char* escaped_output, size_t es
         snprintf(id, sizeof(id), "null");
     }
 
-    if (strcmp(method, "initialize") == 0) {
-        if (!is_notification) handle_initialize(id);
-    } else if (strcmp(method, "notifications/initialized") == 0) {
-        // No response needed (correct per JSON-RPC 2.0 — this is always a notification)
-    } else if (strcmp(method, "tools/list") == 0) {
-        if (!is_notification) handle_tools_list(id);
-    } else if (strcmp(method, "tools/call") == 0) {
-        if (is_notification) return;  // Notifications MUST NOT produce a response
-        char tool_name[64] = {0};
-        extract_json_string(line, "name", tool_name, sizeof(tool_name));
-        // raw_output is heap-allocated in main() — reentrant-safe
-        int exec_res;
-        const ToolDef* tool = dispatch_tool_call(line, tool_name,
-                                                raw_output, raw_output_size,
-                                                &exec_res);
-        if (tool) {
-            send_mcp_response(id, tool, exec_res, raw_output,
-                             escaped_output, escaped_size);
-        } else {
-            // Tool not found — raw_output already contains "Unknown tool"
-            // Use TOOLS[0] as a text-only fallback for the response
-            send_mcp_response(id, &TOOLS[0], -1, raw_output,
-                             escaped_output, escaped_size);
+    size_t num_methods = sizeof(METHODS) / sizeof(METHODS[0]);
+    for (size_t i = 0; i < num_methods; i++) {
+        if (strcmp(method, METHODS[i].method) == 0) {
+            if (is_notification && !METHODS[i].allow_notification) return;
+            METHODS[i].fn(id, line, escaped_output, escaped_size,
+                          raw_output, raw_output_size, is_notification);
+            return;
         }
     }
+
+    /* Unknown method */
+    handle_unknown_method(id, line, escaped_output, escaped_size,
+                          raw_output, raw_output_size, is_notification);
+}
+
+/* ------------------------------------------------------------------- */
+/* DEVICE RESOLUTION                                                   */
+/* ------------------------------------------------------------------- */
+static int dev_width = 0;
+static int dev_height = 0;
+/* @single-threaded — queried once on first screenshot, read-only thereafter
+ * in the single-threaded MCP event loop. Safe without synchronization. */
+
+/* Resolution query is lazy: called on first screenshot request */
+static void query_device_resolution(void) {
+    char buf[128] = {0};
+    /* NOTE: "wm size" is Android-specific — requires Android's WindowManager
+     * shell command. Not available on non-Android Linux or other platforms. */
+    int res = exec_stream_cmd("wm size", buf, sizeof(buf));
+    if (res == 0) {
+        /* Output: "Physical size: 1080x2340\n" (or "Override size: ...") */
+        const char* p = strchr(buf, ':');
+        if (p) {
+            p++;
+            while (*p == ' ') p++;
+            if (sscanf(p, "%dx%d", &dev_width, &dev_height) == 2) {
+                fprintf(stderr, "[MCP] Device resolution: %dx%d\n", dev_width, dev_height);
+                return;
+            }
+        }
+    }
+    fprintf(stderr, "[MCP] Could not detect device resolution (wm size failed)\n");
+}
+
+/* Builds the metadata text describing screenshot dimensions and scale.
+ * Handles the case where device resolution or image dimensions are unknown. */
+static void build_response_meta(int dev_w, int dev_h, int orig_w, int orig_h,
+                                float scale_x, float scale_y,
+                                char* meta, size_t meta_size) {
+    if (orig_w <= 0 || orig_h <= 0) {
+        snprintf(meta, meta_size, "Screenshot (unknown size)");
+    } else if (dev_w > 0) {
+        snprintf(meta, meta_size,
+            "Screen: %dx%d | Image: %dx%d | Scale: %.2fx %.2fy. "
+            "Multiply image coords by scale to get device coords.",
+            dev_w, dev_h, orig_w, orig_h,
+            (double)scale_x, (double)scale_y);
+    } else {
+        snprintf(meta, meta_size,
+            "Image: %dx%d | Device resolution unknown. "
+            "Use image coordinates directly.",
+            orig_w, orig_h);
+    }
+}
+
+/* Formats a JSON-RPC id as a JSON value: "null" for notifications,
+ * or a quoted escaped string otherwise. */
+static void format_json_id(const char* id, char* out, size_t out_size) {
+    if (strcmp(id, "null") == 0) {
+        snprintf(out, out_size, "null");
+    } else {
+        char esc_id[256];
+        escape_json_string(id, esc_id, sizeof(esc_id));
+        snprintf(out, out_size, "\"%s\"", esc_id);
+    }
+}
+
+/* Builds a JSON-RPC response with text metadata + image content for screenshot.
+ * Uses three sequential printf calls (prefix, base64 data, suffix) to avoid
+ * the fragile in-place memmove approach that previously dual-purposed the
+ * escaped buffer. */
+static void send_screenshot_response(const char* id, int orig_w, int orig_h,
+                                     const char* raw_b64, char* escaped_buf,
+                                     size_t escaped_size) {
+    // Lazily query device resolution on first screenshot request
+    if (dev_width == 0) query_device_resolution();
+
+    // P1 guard: prevent division by zero in scaling computation
+    if (orig_w <= 0 || orig_h <= 0) { orig_w = 0; orig_h = 0; }
+    float scale_x = 1.0f, scale_y = 1.0f;
+    if (orig_w > 0 && orig_h > 0) {
+        scale_x = (dev_width > 0) ? (float)dev_width / (float)orig_w : 1.0f;
+        scale_y = (dev_height > 0) ? (float)dev_height / (float)orig_h : 1.0f;
+    }
+
+    // Escape the base64 image data into the buffer
+    size_t b64_escaped = escape_json_string(raw_b64, escaped_buf, escaped_size);
+    if (b64_escaped >= escaped_size) {
+        char id_fmt[512];
+        format_json_id(id, id_fmt, sizeof(id_fmt));
+        printf("{\"jsonrpc\":\"2.0\",\"id\":%s,"
+               "\"result\":{\"isError\":true,\"content\":[{\"type\":\"text\","
+               "\"text\":\"Error: Screenshot output too large.\"}]}}\n",
+               id_fmt);
+        return;
+    }
+
+    // Build and escape metadata text
+    char meta[256];
+    build_response_meta(dev_width, dev_height, orig_w, orig_h,
+                        scale_x, scale_y, meta, sizeof(meta));
+    char escaped_meta[512];
+    size_t meta_escaped = escape_json_string(meta, escaped_meta, sizeof(escaped_meta));
+    if (meta_escaped >= sizeof(escaped_meta)) {
+        memcpy(escaped_meta, "error", 6);
+    }
+
+    // Format JSON-RPC id as a JSON value
+    char id_fmt[512];
+    format_json_id(id, id_fmt, sizeof(id_fmt));
+
+    // Print JSON-RPC prefix with metadata (no in-place buffer manipulation)
+    printf("{\"jsonrpc\":\"2.0\",\"id\":%s,"
+           "\"result\":{\"content\":["
+           "{\"type\":\"text\",\"text\":\"%s\"},"
+           "{\"type\":\"image\",\"mimeType\":\"image/png\",\"data\":\"",
+           id_fmt, escaped_meta);
+
+    // Print escaped base64 image data
+    printf("%s", escaped_buf);
+
+    // Print JSON suffix
+    printf("\"}]}}\n");
 }
 
 // -------------------------------------------------------------------
