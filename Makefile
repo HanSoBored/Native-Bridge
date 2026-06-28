@@ -24,7 +24,15 @@ $(BUILDDIR)/andro: $(SRCDIR)/main/client.c | $(BUILDDIR)
 # Target MCP
 mcp: $(BUILDDIR)/nativeb_mcp
 
-$(BUILDDIR)/nativeb_mcp: $(SRCDIR)/main/mcp.c | $(BUILDDIR)
+# lodepng.c uses pre-C23 style declarations; relax diagnostics for that TU only
+$(BUILDDIR)/lodepng.o: $(SRCDIR)/common/lodepng.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) -Wno-old-style-definition -Wno-strict-prototypes -c $< -o $@
+
+# Explicit rule so screenshot.o uses project CFLAGS before linking into nativeb_mcp
+$(BUILDDIR)/screenshot.o: $(SRCDIR)/common/screenshot.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILDDIR)/nativeb_mcp: $(SRCDIR)/main/mcp.c $(BUILDDIR)/screenshot.o $(BUILDDIR)/lodepng.o | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(LDFLAGS) $^ -o $@
 
 clean:
