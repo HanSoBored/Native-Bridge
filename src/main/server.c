@@ -1,7 +1,9 @@
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <assert.h>
 #include <pthread.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -12,6 +14,10 @@
 #include <getopt.h>
 #include "common.h"
 #include "input.h"
+
+#define MAX_ARGS 64
+
+static const char ERR_EXEC_FAILED[] = "Failed to execute command";
 
 typedef struct {
     int sock;
@@ -24,12 +30,13 @@ typedef struct {
     int is_stderr;
 } StreamArg;
 
-static void send_packet(ClientCtx* ctx, uint32_t type, const void* payload, uint32_t len) {
+static int send_packet(ClientCtx* ctx, uint32_t type, const void* payload, uint32_t len) {
     PacketHeader hdr = {type, len};
     pthread_mutex_lock(&ctx->mutex);
-    write_all(ctx->sock, &hdr, sizeof(hdr));
-    if (len > 0) write_all(ctx->sock, payload, len);
+    int res = write_all(ctx->sock, &hdr, sizeof(hdr));
+    if (res == 0 && len > 0) res = write_all(ctx->sock, payload, len);
     pthread_mutex_unlock(&ctx->mutex);
+    return res;
 }
 
 static void* stream_reader(void* arg) {
@@ -38,12 +45,291 @@ static void* stream_reader(void* arg) {
     ssize_t n;
 
     while ((n = read(sa->fd, buffer, sizeof(buffer))) > 0) {
-        send_packet(sa->ctx, sa->is_stderr ? RESP_STREAM_ERR : RESP_STREAM_CHUNK, buffer, (uint32_t)n);
+        if (send_packet(sa->ctx, sa->is_stderr ? RESP_STREAM_ERR : RESP_STREAM_CHUNK, buffer, (uint32_t)n) < 0) {
+            break;  /* write failed — client connection broken */
+        }
     }
     close(sa->fd);
     return NULL;
 }
 
+/* ------------------------------------------------------------------- */
+/* SHARED HELPERS                                                      */
+/* ------------------------------------------------------------------- */
+
+/* parse_argv - Parse null-terminated payload into argv array
+ * @payload: Null-terminated string sequence (each token \0-delimited)
+ * @len: Total payload length in bytes
+ * @args: Output array for parsed tokens
+ * @max_args: Maximum number of tokens
+ * Returns: argc (number of tokens), or 0 if empty */
+static int parse_argv(char* payload, uint32_t len, char** args, int max_args) {
+    int argc = 0;
+    char* ptr = payload;
+    while (ptr < payload + len && argc < max_args - 1) {
+        args[argc++] = ptr;
+        size_t max_scan = (size_t)((payload + (ptrdiff_t)len) - ptr);
+        if (max_scan == 0) break;
+        size_t token_len = strnlen(ptr, max_scan);
+        ptr += token_len + 1;
+    }
+    args[argc] = NULL;
+    return argc;
+}
+
+/* Shared helper: validates non-empty payload and parses into argv array.
+ * Returns argc on success, -1 on error (error packet already sent via ctx). */
+static int parse_command_payload(ClientCtx* ctx, char* payload, uint32_t len,
+                                  char** args, int max_args) {
+    if (!payload || len == 0) {
+        char* err = "Empty command.";
+        size_t err_len = strlen(err);
+        send_packet(ctx, RESP_ERROR, err, (uint32_t)err_len);
+        return -1;
+    }
+
+    int argc = parse_argv(payload, len, args, max_args);
+    if (argc == 0 || args[0] == NULL) {
+        char* err = "Empty command or missing command name.";
+        size_t err_len = strlen(err);
+        send_packet(ctx, RESP_ERROR, err, (uint32_t)err_len);
+        return -1;
+    }
+
+    return argc;
+}
+
+/* fork_exec - Fork and exec a command with redirected output
+ * @args: argv array (NULL-terminated)
+ * @argc: number of arguments
+ * @close_fd: fd to close in child (e.g., client socket), or -1
+ * @out_fd: output pipe read fd (set in parent), or NULL
+ * @err_fd: stderr pipe read fd (set in parent), NULL = merge to stdout
+ * Returns: child PID on success, -1 on error */
+static pid_t fork_exec(char** args, int argc, int close_fd,
+                       int* out_fd, int* err_fd) {
+    int pipe_out[2];
+    if (pipe(pipe_out) < 0) return -1;
+
+    int pipe_err[2];
+    int sep = (err_fd != NULL);
+    if (sep) {
+        if (pipe(pipe_err) < 0) { close(pipe_out[0]); close(pipe_out[1]); return -1; }
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pipe_out[0]); close(pipe_out[1]);
+        if (sep) { close(pipe_err[0]); close(pipe_err[1]); }
+        return -1;
+    }
+
+    if (pid == 0) {
+        /* Child: redirect stdout and stderr to pipes */
+        close(pipe_out[0]);
+        if (dup2(pipe_out[1], STDOUT_FILENO) < 0) _exit(1);
+        close(pipe_out[1]);
+        if (sep) {
+            close(pipe_err[0]);
+            if (dup2(pipe_err[1], STDERR_FILENO) < 0) _exit(1);
+            close(pipe_err[1]);
+        } else {
+            if (dup2(STDOUT_FILENO, STDERR_FILENO) < 0) _exit(1);
+        }
+        if (close_fd >= 0) close(close_fd);
+
+        if (argc == 1) {
+            char* sh_args[] = {"sh", "-c", args[0], NULL};
+            execvp("sh", sh_args);
+        } else {
+            execvp(args[0], args);
+        }
+        perror("execvp");
+        _exit(1);
+    }
+
+    /* Parent: close write ends, set read fds */
+    close(pipe_out[1]);
+    if (sep) close(pipe_err[1]);
+    if (out_fd) *out_fd = pipe_out[0];
+    if (err_fd) *err_fd = sep ? pipe_err[0] : -1;
+    return pid;
+}
+
+/* ------------------------------------------------------------------- */
+/* CMD HANDLERS (SRP — each handles one command type)                  */
+/* ------------------------------------------------------------------- */
+
+static int handle_client_ping(ClientCtx* ctx) {
+    char* msg = "Pong!";
+    size_t msg_len = strlen(msg) + 1;
+    /* "Pong!" is 6 bytes, trivially safe */
+    return send_packet(ctx, RESP_SUCCESS, msg, (uint32_t)msg_len);
+}
+
+#ifdef DIRECT_INPUT
+static int handle_client_tap(ClientCtx* ctx, PayloadTap* tap) {
+    fprintf(stderr, "[SERVER] CMD_TAP (%d, %d)\n", tap->x, tap->y);
+    if (input_tap(tap->x, tap->y) == 0) {
+        return send_packet(ctx, RESP_SUCCESS, "", 0);
+    } else {
+        char* err = "Tap failed (check server stderr for details)";
+        size_t err_len = strlen(err);
+        /* error messages are short */
+        return send_packet(ctx, RESP_ERROR, err, (uint32_t)err_len);
+    }
+}
+
+static int handle_client_swipe(ClientCtx* ctx, PayloadSwipe* swipe) {
+    fprintf(stderr, "[SERVER] CMD_SWIPE (%d,%d)->(%d,%d) dur=%lu\n",
+            swipe->x1, swipe->y1, swipe->x2, swipe->y2, (unsigned long)swipe->duration_ms);
+    if (input_swipe(swipe->x1, swipe->y1, swipe->x2, swipe->y2, swipe->duration_ms) == 0) {
+        return send_packet(ctx, RESP_SUCCESS, "", 0);
+    } else {
+        char* err = "Swipe failed (check server stderr for details)";
+        size_t err_len = strlen(err);
+        /* error messages are short */
+        return send_packet(ctx, RESP_ERROR, err, (uint32_t)err_len);
+    }
+}
+#endif
+
+/* Extract first whitespace-delimited token from a command string.
+ * Returns 1 if a token was found, 0 if empty. */
+static int get_first_token(const char* cmd, char* token, size_t token_size) {
+    while (*cmd == ' ' || *cmd == '\t') cmd++;
+    size_t i = 0;
+    while (cmd[i] && cmd[i] != ' ' && cmd[i] != '\t' && i < token_size - 1) {
+        token[i] = cmd[i];
+        i++;
+    }
+    token[i] = '\0';
+    return (i > 0) ? 1 : 0;
+}
+
+/* Validates logcat-specific arguments for CMD_EXEC.
+ * Returns an error string if invalid, NULL if valid. */
+static const char* validate_logcat_exec_args(char** args, int argc) {
+    /* args[0] is a shell command string; extract first word */
+    char first_token[64];
+    if (!get_first_token(args[0], first_token, sizeof(first_token)))
+        return NULL;  /* empty command, let caller handle */
+    if (strcmp(first_token, "logcat") == 0) {
+        int valid = (argc == 2 && (strcmp(args[1], "-d") == 0 || strcmp(args[1], "-c") == 0));
+        if (!valid) {
+            return "Use CMD_STREAM for live logcat. Only 'logcat -d' or '-c' allowed with CMD_EXEC.";
+        }
+    }
+    return NULL;
+}
+
+/* Reads data from a pipe fd into a buffer until EOF or buffer full.
+ * Returns total bytes read, or -1 on read error. */
+static ssize_t read_pipe_to_buffer(int fd, char* buf, size_t bufsize) {
+    ssize_t total = 0;
+    ssize_t n;
+    while (total < (ssize_t)bufsize - 1 &&
+           (n = read(fd, buf + total, bufsize - (size_t)total - 1)) > 0)
+        total += n;
+    return (n < 0) ? -1 : total;
+}
+
+static int handle_client_exec(ClientCtx* ctx, char* payload, uint32_t len) {
+    char* args[MAX_ARGS];
+    int argc = parse_command_payload(ctx, payload, len, args, MAX_ARGS);
+    if (argc < 0) return -1;
+
+    /* Validate logcat-specific args */
+    const char* logcat_err = validate_logcat_exec_args(args, argc);
+    if (logcat_err) {
+        size_t err_len = strlen(logcat_err);
+        return send_packet(ctx, RESP_ERROR, logcat_err, (uint32_t)err_len);
+    }
+
+    int out_fd;
+    pid_t pid = fork_exec(args, argc, ctx->sock, &out_fd, NULL);
+    if (pid < 0) {
+        const char* err = ERR_EXEC_FAILED;
+        size_t err_len = strlen(err);
+        return send_packet(ctx, RESP_ERROR, err, (uint32_t)err_len);
+    }
+
+    char* out = calloc(1, 8192);
+    if (!out) {
+        char* err = "Out of memory reading command output";
+        size_t err_len = strlen(err);
+        close(out_fd);
+        return send_packet(ctx, RESP_ERROR, err, (uint32_t)err_len);
+    }
+    ssize_t total = read_pipe_to_buffer(out_fd, out, 8192);
+    close(out_fd);
+    if (total < 0) total = 0;
+    /* Warn if output may have been truncated (buffer full at 8191 bytes) */
+    if (total == 8191) {
+        fprintf(stderr, "Warning: command output possibly truncated "
+                        "(%zd bytes, 8KB buffer limit)\n", total);
+    }
+
+    int status;
+    waitpid(pid, &status, 0);
+    /* total is always <= 8192: read_pipe_to_buffer clamps at bufsize-1 */
+    assert(total >= 0 && total < 8192);
+    int ret;
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+        ret = send_packet(ctx, RESP_SUCCESS, out, (uint32_t)total);
+    } else if (WIFSIGNALED(status)) {
+        char sig_msg[64];
+        snprintf(sig_msg, sizeof(sig_msg), "Killed by signal %d", WTERMSIG(status));
+        ret = send_packet(ctx, RESP_ERROR, sig_msg, (uint32_t)strlen(sig_msg) + 1);
+    } else {
+        ret = send_packet(ctx, RESP_ERROR, out, (uint32_t)total);
+    }
+    free(out);
+    return ret;
+}
+
+static int handle_client_stream(ClientCtx* ctx, char* payload, uint32_t len) {
+    char* args[MAX_ARGS];
+    int argc = parse_command_payload(ctx, payload, len, args, MAX_ARGS);
+    if (argc < 0) return -1;
+
+    int out_fd, err_fd;
+    pid_t pid = fork_exec(args, argc, ctx->sock, &out_fd, &err_fd);
+    if (pid < 0) {
+        const char* err = ERR_EXEC_FAILED;
+        size_t err_len = strlen(err);
+        return send_packet(ctx, RESP_ERROR, err, (uint32_t)err_len);
+    }
+
+    pthread_t t1, t2;
+    StreamArg arg_out = {ctx, out_fd, 0};
+    StreamArg arg_err = {ctx, err_fd, 1};
+
+    if (pthread_create(&t1, NULL, stream_reader, &arg_out) != 0) {
+        close(out_fd); close(err_fd); return -1;
+    }
+    if (pthread_create(&t2, NULL, stream_reader, &arg_err) != 0) {
+        close(out_fd); pthread_join(t1, NULL);
+        close(err_fd); return -1;
+    }
+    pthread_join(t1, NULL); pthread_join(t2, NULL);
+
+    int status;
+    waitpid(pid, &status, 0);
+    if (WIFEXITED(status) && WEXITSTATUS(status) != 0)
+        return send_packet(ctx, RESP_ERROR, "Command failed", 15);
+    return send_packet(ctx, RESP_STREAM_END, "", 0);
+}
+
+static int handle_client_unknown(ClientCtx* ctx) {
+    char* err = "Unknown command or invalid payload";
+    size_t err_len = strlen(err);
+    return send_packet(ctx, RESP_ERROR, err, (uint32_t)err_len);
+}
+
+/* ------------------------------------------------------------------- */
+/* DISPATCH FUNCTION (thin — header reading + dispatch + cleanup)      */
+/* ------------------------------------------------------------------- */
 static void* handle_client(void* arg) {
     int client_sock = (int)(intptr_t)arg;
     ClientCtx ctx = { .sock = client_sock };
@@ -51,148 +337,48 @@ static void* handle_client(void* arg) {
 
     PacketHeader hdr;
     if (read_all(client_sock, &hdr, sizeof(hdr)) < 0) goto cleanup_sock;
-
     if (hdr.len > MAX_PAYLOAD_SIZE) goto cleanup_sock;
 
     char* payload = NULL;
     if (hdr.len > 0) {
-        payload = malloc(hdr.len + 1); // Extra byte for safety
+        payload = malloc(hdr.len + 1);
         if (!payload) goto cleanup_sock;
         if (read_all(client_sock, payload, hdr.len) < 0) goto cleanup_mem;
-        payload[hdr.len] = '\0'; // Ensure termination
+        payload[hdr.len] = '\0';
     }
 
-    if (hdr.type == CMD_PING) {
-        char* msg = "Pong!";
-        send_packet(&ctx, RESP_SUCCESS, msg, (uint32_t)(strlen(msg) + 1));
-    }
-    #ifdef DIRECT_INPUT
-    else if (hdr.type == CMD_TAP && hdr.len == sizeof(PayloadTap)) {
-        PayloadTap* tap = (PayloadTap*)payload;
-        input_tap(tap->x, tap->y);
-        send_packet(&ctx, RESP_SUCCESS, "", 0);
-    }
-    else if (hdr.type == CMD_SWIPE && hdr.len == sizeof(PayloadSwipe)) {
-        PayloadSwipe* swipe = (PayloadSwipe*)payload;
-        input_swipe(swipe->x1, swipe->y1, swipe->x2, swipe->y2, swipe->duration_ms);
-        send_packet(&ctx, RESP_SUCCESS, "", 0);
-    }
-    #endif
-    else if (hdr.type == CMD_EXEC || hdr.type == CMD_STREAM) {
-        if (!payload || hdr.len == 0) {
-            char* err = "Empty command.";
-            send_packet(&ctx, RESP_ERROR, err, (uint32_t)strlen(err));
-            goto cleanup_mem;
+    {
+        int ret = 0;
+        if (hdr.type == CMD_PING) {
+            ret = handle_client_ping(&ctx);
         }
-
-        char* args[64];
-        int argc = 0;
-        char* ptr = payload;
-        while (ptr < payload + hdr.len && argc < 63) {
-            args[argc++] = ptr;
-            // Safe increment: don't scan past hdr.len
-            size_t max_scan = (size_t)((payload + (ptrdiff_t)hdr.len) - ptr);
-            size_t token_len = (ptr[max_scan - 1] == '\0') ? strlen(ptr) : max_scan - 1;
-            ptr += token_len + 1;
+        #ifdef DIRECT_INPUT
+        else if (hdr.type == CMD_TAP && hdr.len == sizeof(PayloadTap)) {
+            ret = handle_client_tap(&ctx, (PayloadTap*)payload);
         }
-        args[argc] = NULL;
-
-        if (argc == 0 || args[0] == NULL) goto cleanup_mem;
-
-        if (strcmp(args[0], "logcat") == 0) {
-            int valid = (argc == 2 && (strcmp(args[1], "-d") == 0 || strcmp(args[1], "-c") == 0));
-            if (hdr.type == CMD_STREAM) valid = 1; // Allow live logcat for stream
-            if (!valid) {
-                char* err = "Use CMD_STREAM for live logcat. Only 'logcat -d' or '-c' allowed with CMD_EXEC.";
-                send_packet(&ctx, RESP_ERROR, err, (uint32_t)strlen(err));
-                goto cleanup_mem;
-            }
+        else if (hdr.type == CMD_SWIPE && hdr.len == sizeof(PayloadSwipe)) {
+            ret = handle_client_swipe(&ctx, (PayloadSwipe*)payload);
         }
-
-        if (hdr.type == CMD_EXEC) {
-            int pipefd[2];
-            if (pipe(pipefd) < 0) {
-                char* err = "Failed to create pipe";
-                send_packet(&ctx, RESP_ERROR, err, (uint32_t)strlen(err));
-                goto cleanup_mem;
-            }
-            pid_t pid = fork();
-            if (pid == 0) {
-                dup2(pipefd[1], STDOUT_FILENO); 
-                dup2(pipefd[1], STDERR_FILENO);
-                close(pipefd[0]); 
-                close(pipefd[1]);
-                // Close the client socket in the child to prevent leaks
-                close(client_sock);
-
-                if (argc == 1) {
-                    char* sh_args[] = {"sh", "-c", args[0], NULL};
-                    execvp("sh", sh_args);
-                } else {
-                    execvp(args[0], args);
-                }
-                
-                // If execvp fails, the error message from perror will go to the pipe
-                perror("execvp");
-                exit(1);
-            }
-            close(pipefd[1]);
-
-            char out[8192] = {0};
-            int total = 0;
-            ssize_t n;
-            while(total < (int)sizeof(out)-1 && (n = read(pipefd[0], out + total, (size_t)((int)sizeof(out) - total - 1))) > 0) total += (int)n;
-            close(pipefd[0]);
-
-            int status; waitpid(pid, &status, 0);
-            if (WIFEXITED(status) && WEXITSTATUS(status) == 0)
-                send_packet(&ctx, RESP_SUCCESS, out, (uint32_t)total);
-            else
-                send_packet(&ctx, RESP_ERROR, out, (uint32_t)total);
-
-        } else if (hdr.type == CMD_STREAM) {
-            int pipe_out[2], pipe_err[2];
-            if (pipe(pipe_out) < 0 || pipe(pipe_err) < 0) {
-                char* err = "Failed to create streaming pipes";
-                send_packet(&ctx, RESP_ERROR, err, (uint32_t)strlen(err));
-                goto cleanup_mem;
-            }
-            pid_t pid = fork();
-            if (pid == 0) {
-                dup2(pipe_out[1], STDOUT_FILENO); 
-                dup2(pipe_err[1], STDERR_FILENO);
-                close(pipe_out[0]); close(pipe_out[1]); 
-                close(pipe_err[0]); close(pipe_err[1]);
-                close(client_sock);
-                
-                if (argc == 1) {
-                    char* sh_args[] = {"sh", "-c", args[0], NULL};
-                    execvp("sh", sh_args);
-                } else {
-                    execvp(args[0], args);
-                }
-
-                perror("execvp (stream)");
-                exit(1);
-            }
-            close(pipe_out[1]); close(pipe_err[1]);
-
-            pthread_t t1, t2;
-            StreamArg arg_out = {&ctx, pipe_out[0], 0};
-            StreamArg arg_err = {&ctx, pipe_err[0], 1};
-
-            pthread_create(&t1, NULL, stream_reader, &arg_out);
-            pthread_create(&t2, NULL, stream_reader, &arg_err);
-            pthread_join(t1, NULL); pthread_join(t2, NULL);
-
-            waitpid(pid, NULL, 0);
-            send_packet(&ctx, RESP_STREAM_END, "", 0);
+        #endif
+        else if (hdr.type == CMD_EXEC) {
+            ret = handle_client_exec(&ctx, payload, hdr.len);
+        }
+        else if (hdr.type == CMD_STREAM) {
+            ret = handle_client_stream(&ctx, payload, hdr.len);
+        }
+        else {
+            ret = handle_client_unknown(&ctx);
+        }
+        if (ret < 0) {
+            /* send_packet failed — client connection is broken,
+             * fall through to cleanup */
         }
     }
 
 cleanup_mem:
     if (payload) free(payload);
 cleanup_sock:
+    pthread_mutex_destroy(&ctx.mutex);
     close(client_sock);
     return NULL;
 }
@@ -258,7 +444,7 @@ int main(int argc, char *argv[]) {
     }
     memcpy(addr.sun_path, socket_path, path_len + 1);
 
-    // Set umask to 0 so we can explicitly control permissions
+    /* Set umask to 0 so we can explicitly control permissions */
     mode_t old_mask = umask(0000);
     if (bind(server_sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         perror("Failed to bind socket");
@@ -267,17 +453,17 @@ int main(int argc, char *argv[]) {
     }
     umask(old_mask);
 
-    // Socket permissions: 0666 (rw-rw-rw-)
-    //
-    // WHY: The server runs as root on Android Host. Clients run as a non-root
-    // user inside a chroot. The chroot's user database is invisible to the
-    // Android kernel, so:
-    //   - 0660 fails: the chroot user isn't root or in root's group on Android
-    //   - SO_PEERCRED fails: UID namespaces differ between chroot and host
-    //   - Group chown fails: the group doesn't exist on Android's /etc/group
-    //
-    // The chroot IS the security boundary. Any process inside it is already
-    // trusted. See docs/ADR-001-socket-permissions.md for full analysis.
+    /* Socket permissions: 0666 (rw-rw-rw-)
+     *
+     * WHY: The server runs as root on Android Host. Clients run as a non-root
+     * user inside a chroot. The chroot's user database is invisible to the
+     * Android kernel, so:
+     *   - 0660 fails: the chroot user isn't root or in root's group on Android
+     *   - SO_PEERCRED fails: UID namespaces differ between chroot and host
+     *   - Group chown fails: the group doesn't exist on Android's /etc/group
+     *
+     * The chroot IS the security boundary. Any process inside it is already
+     * trusted. See docs/ADR-001-socket-permissions.md for full analysis. */
     if (chmod(socket_path, 0666) < 0) {
         perror("Failed to chmod socket");
     }
@@ -285,6 +471,7 @@ int main(int argc, char *argv[]) {
     listen(server_sock, 10);
 
     printf("Bridge Server active at: %s (Permissions: 0666)\n", socket_path);
+    /* Feature: DIRECT_INPUT — touch device status */
     #ifdef DIRECT_INPUT
     if (touch_enabled) {
         printf("[Feature Enabled] Direct Kernel Input Module Loaded\n");
@@ -299,7 +486,10 @@ int main(int argc, char *argv[]) {
         if (client_sock < 0) continue;
 
         pthread_t tid;
-        pthread_create(&tid, NULL, handle_client, (void*)(intptr_t)client_sock);
+        if (pthread_create(&tid, NULL, handle_client, (void*)(intptr_t)client_sock) != 0) {
+            close(client_sock);
+            continue;
+        }
         pthread_detach(tid);
     }
     return 0;
