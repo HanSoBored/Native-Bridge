@@ -162,7 +162,21 @@ To use it with **Claude Desktop** or **Cursor**, add the following to your MCP c
   }
 }
 ```
-*Security Note: The MCP server includes a built-in blacklist blocking destructive commands (e.g., `rm`, `reboot`, `dd`, `su`).*
+*Security Note: The MCP server includes a command blacklist that blocks destructive commands from the AI agent. The blacklist is configurable via a JSON file (see below) — by default it is empty (nothing is blocked), so configure it before exposing the MCP server to agents.*
+
+### Configuring the command blacklist
+
+The MCP server loads its blacklist at startup from `~/.config/native-bridge/blacklist.json` (on where `nativeb_mcp` runs). You can override the path with the `NATIVE_BRIDGE_CONFIG` environment variable. If no config file is found, the built-in default applies (an empty list — nothing is blocked). If an explicitly-specified config file is missing or malformed, the server refuses to start; an auto-discovered malformed file is ignored with a warning and the defaults are used.
+
+Format (copy `blacklist.example.json` for a starter):
+
+```json
+{
+  "blocked_commands": ["reboot"]
+}
+```
+
+Entries **replace** the default — an empty list blocks nothing. Commands are matched by exact name or by basename. Restart the MCP server after editing. Keep the file readable only by you (e.g. `chmod 600`) since it defines the agent's command policy.
 
 ## Troubleshooting
 

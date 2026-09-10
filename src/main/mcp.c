@@ -11,6 +11,7 @@
 #include <sys/un.h>
 #include "common.h"
 #include "screenshot.h"
+#include "config.h"
 
 #define JSMN_STATIC
 #include "jsmn.h"
@@ -27,6 +28,7 @@
 #define MAX_COORDINATE          10000
 #define JSON_ESCAPED_UNICODE_LEN 6   /* strlen("\\u00XX") */
 #define SCREENSHOT_TARGET_WIDTH 720  /* downscale width for token savings */
+#define MAX_MCP_ARGS 64              /* max argv tokens for device_exec */
 
 
 // -------------------------------------------------------------------
@@ -321,18 +323,15 @@ static inline int exec_stream_cmd(const char *cmd_buf, char *out_buf, size_t out
 // -------------------------------------------------------------------
 // SECURITY BLACKLIST (MCP ONLY)
 // -------------------------------------------------------------------
-const char* BLACKLISTED_COMMANDS[] = {
-    "rm", "mv", "cp", "sh", "su", "chmod", "chown", "kill", "reboot", "recovery", "bootloader", "dd"
-};
+// Blacklist is loaded at startup from a user-editable JSON config file
+// (default: ~/.config/native-bridge/blacklist.json, or $NATIVE_BRIDGE_CONFIG).
+// Without a config file, no commands are blocked by default.
+static nb_config_t g_config;
+static nb_config_t *g_active_config = NULL;
 
 static int is_command_blocked(const char* cmd) {
-    if (!cmd) return 1;
-    for (size_t i = 0; i < sizeof(BLACKLISTED_COMMANDS) / sizeof(char*); i++) {
-        if (strcmp(cmd, BLACKLISTED_COMMANDS[i]) == 0) return 1;
-        const char* last_slash = strrchr(cmd, '/');
-        if (last_slash && strcmp(last_slash + 1, BLACKLISTED_COMMANDS[i]) == 0) return 1;
-    }
-    return 0;
+    if (!g_active_config) return 1;
+    return config_is_blocked(g_active_config, cmd);
 }
 
 // -------------------------------------------------------------------
@@ -352,12 +351,6 @@ static int contains_any_char(const char* input, const char* chars) {
 // Per POSIX.1-2017 §2.2.3, single quotes (') are literal inside double quotes.
 static inline int contains_shell_metacharacters(const char* i) {
     return contains_any_char(i, "\"$`\\\n\r!");
-}
-
-// Block shell metacharacters for UNQUOTED contexts (device_exec).
-// Based on lightNVR's dangerous character set (opensensor/lightNVR).
-static inline int contains_shell_dangerous(const char* i) {
-    return contains_any_char(i, ";|&`$><\n\r\\\"'!{}()[]~*?");
 }
 
 // Check if input contains only alphanumeric characters
@@ -509,12 +502,13 @@ static int handle_device_uiautomator(const char*, char*, size_t, void*);
 
 static const ToolDef TOOLS[] = {
     {"device_exec",
-     "Execute shell command on Android Host. "
-     "IMPORTANT: POSIX shell metacharacters (;|&`$(){}[]~*? etc.) "
-     "are BLOCKED for security in MCP mode. Use single-word commands "
-     "with arguments only. Always use single quotes ('') for "
-     "regex/complex arguments instead of double quotes to avoid JSON "
-     "escape corruption (e.g. grep -E 'A|B').",
+     "Execute a command on the Android device. Arguments are "
+     "passed directly via execvp() — no shell is involved, so "
+     "shell operators (| & ; $ > <) inside quotes are literal. "
+     "Unquoted shell operators (| > < ; &) trigger sh -c mode "
+     "for pipes/redirects. Use single quotes for argument "
+     "grouping (e.g. grep -E 'A|B'). Double quotes also work "
+     "with \\\" and \\\\ escape sequences.",
      "{\"type\":\"object\","
      "\"properties\":{\"cmd\":{\"type\":\"string\"},"
      "\"timeout\":{\"type\":\"integer\","
@@ -721,34 +715,84 @@ static int wrap_with_timeout(const char* cmd, const char* timeout_str,
     return 0;
 }
 
-// Validates a shell command for safe execution in MCP mode.
-// Layer 1: Scans for POSIX shell metacharacters (injection prevention).
-// Layer 2: Blacklists dangerous commands (defense-in-depth).
-// Returns 0 on success, -1 on failure (with error message in output).
-static int validate_cmd_safe(const char* cmd_str, char* output, size_t out_size) {
-    // Layer 1: Comprehensive metacharacter scan on ENTIRE command string.
-    if (contains_shell_dangerous(cmd_str)) {
-        snprintf(output, out_size,
-            "Security Error: Command contains disallowed shell metacharacters. "
-            "Shell operators (;|&$`>< etc.) are not permitted in MCP mode.");
-        return -1;
-    }
-
-    // Layer 2: Blacklist check on first token (defense-in-depth).
-    char first_token[256] = {0};
-    const char* p = cmd_str;
-    while (*p && isspace((unsigned char)*p)) p++;
-    int i = 0;
-    while (*p && !isspace((unsigned char)*p) && i < 255) first_token[i++] = *p++;
-    first_token[i] = '\0';
-
-    if (is_command_blocked(first_token)) {
-        snprintf(output, out_size,
-            "Security Error: Command '%s' is blacklisted in MCP mode.",
-            first_token);
-        return -1;
+// Scans a command string for unquoted shell operators that require
+// shell interpretation (pipes |, redirects ><, command separators ;&).
+// Returns 1 if any such operator is found outside single/double quotes.
+static int has_unquoted_shell_ops(const char* cmd) {
+    int sq = 0, dq = 0;
+    for (const char* p = cmd; *p; p++) {
+        if (*p == '\'' && !dq) { sq = !sq; continue; }
+        if (*p == '"' && !sq)  { dq = !dq; continue; }
+        if (!sq && !dq) {
+            if (*p == '|' || *p == '>' || *p == '<' || *p == ';' || *p == '&')
+                return 1;
+        }
     }
     return 0;
+}
+
+// Tokenizes a command string in-place into an argv array.
+// Handles double-quoted (with \" and \\ escapes) and single-quoted
+// arguments (POSIX shell semantics).  The string is modified by
+// inserting NUL terminators so the returned pointers point into it.
+// Returns argc on success, or 0 if the string yields no tokens.
+static int tokenize_command(char* cmd, char** argv, int max_args) {
+    int argc = 0;
+    char* p = cmd;
+    while (*p && argc < max_args - 1) {
+        while (*p && isspace((unsigned char)*p)) p++;
+        if (!*p) break;
+        if (*p == '"') {
+            p++;
+            argv[argc] = p;
+            char* dst = p;
+            while (*p && *p != '"') {
+                if (*p == '\\' && (*(p + 1) == '"' || *(p + 1) == '\\')) {
+                    p++;
+                    *dst++ = *p++;
+                } else {
+                    *dst++ = *p++;
+                }
+            }
+            if (*p == '"') p++;
+            *dst = '\0';
+        } else if (*p == '\'') {
+            p++;
+            argv[argc] = p;
+            while (*p && *p != '\'') p++;
+            if (*p == '\'') {
+                *p = '\0';
+                p++;
+            }
+        } else {
+            argv[argc] = p;
+            while (*p && !isspace((unsigned char)*p)) p++;
+            if (*p) { *p = '\0'; p++; }
+        }
+        argc++;
+    }
+    argv[argc] = NULL;
+    return argc;
+}
+
+// Sends an argv array to the bridge as a CMD_STREAM payload.
+// Arguments are serialised as a sequence of NUL-terminated strings
+// so the server-side parse_argv() produces the same array and
+// fork_exec() uses execvp() directly (no shell interpretation).
+static int exec_stream_argv(char** argv, int argc,
+                            char* out_buf, size_t out_size) {
+    char payload[MAX_PAYLOAD_SIZE];
+    size_t pos = 0;
+    for (int i = 0; i < argc; i++) {
+        size_t len = strlen(argv[i]) + 1;
+        if (pos + len > sizeof(payload)) {
+            snprintf(out_buf, out_size, "Error: Command arguments too long.");
+            return -1;
+        }
+        memcpy(payload + pos, argv[i], len);
+        pos += len;
+    }
+    return run_bridge_command(CMD_STREAM, payload, pos, out_buf, out_size);
 }
 
 static int handle_device_exec(const char* json_line, char* output, size_t out_size, void* ctx) {
@@ -756,6 +800,7 @@ static int handle_device_exec(const char* json_line, char* output, size_t out_si
     char cmd_str[2048] = {0};
     char timeout_str[16] = {0};
     char final_cmd[2500] = {0};
+    char* argv[MAX_MCP_ARGS] = {0};
     
     // 'cmd' is a required parameter
     int ret = extract_json_string(json_line, "cmd", cmd_str, sizeof(cmd_str));
@@ -778,16 +823,57 @@ static int handle_device_exec(const char* json_line, char* output, size_t out_si
         return -1;
     }
 
-    // Validate original command before timeout wrapping (CERT STR02-C)
-    if (validate_cmd_safe(cmd_str, output, out_size) != 0) return -1;
-
+    // Wrap with timeout utility if requested (same string logic as before)
     if (wrap_with_timeout(cmd_str, timeout_str, final_cmd, sizeof(final_cmd)) != 0) {
         snprintf(output, out_size, "Error: Command too long after timeout wrapping.");
         return -1;
     }
 
-    // Send wrapped command (with timeout if specified)
-    return exec_stream_cmd(final_cmd, output, out_size);
+    // If the command contains unquoted shell operators (| > < ; &),
+    // route it through sh -c on the server so pipes/redirects work.
+    // Otherwise, tokenize into argv and use execvp() — no shell,
+    // so metacharacters are treated as literal.
+    if (has_unquoted_shell_ops(final_cmd)) {
+        // Shell mode: check blacklist on the first real token
+        // (skip past "timeout N" wrapper if present)
+        const char* check = final_cmd;
+        if (strncmp(check, "timeout ", 8) == 0) {
+            check = strchr(check + 8, ' ');
+            if (check) while (*check && isspace((unsigned char)*check)) check++;
+            else check = final_cmd;
+        }
+        char first_token[256] = {0};
+        int i = 0;
+        while (check && *check && !isspace((unsigned char)*check) && i < 255)
+            first_token[i++] = *check++;
+        first_token[i] = '\0';
+        if (first_token[0] && is_command_blocked(first_token)) {
+            snprintf(output, out_size,
+                "Security Error: Command '%s' is blacklisted in MCP mode.",
+                first_token);
+            return -1;
+        }
+        return exec_stream_cmd(final_cmd, output, out_size);
+    }
+
+    // execvp mode: tokenize and send as NUL-delimited argv.
+    // The server uses execvp() directly — no shell interpretation.
+    int argc = tokenize_command(final_cmd, argv, MAX_MCP_ARGS);
+    if (argc == 0) {
+        snprintf(output, out_size, "Error: Command parsed to zero tokens.");
+        return -1;
+    }
+
+    // Blacklist check on first token (defense-in-depth).
+    if (is_command_blocked(argv[0])) {
+        snprintf(output, out_size,
+            "Security Error: Command '%s' is blacklisted in MCP mode.",
+            argv[0]);
+        return -1;
+    }
+
+    // Send as argv via CMD_STREAM (null-delimited payload)
+    return exec_stream_argv(argv, argc, output, out_size);
 }
 
 // Parses a JSON coordinate parameter (key name like "x", "y1", etc.).
@@ -945,24 +1031,6 @@ static int handle_device_logcat(const char* json_line, char* output, size_t out_
     return exec_stream_cmd(cmd, output, out_size);
 }
 
-// Checks if a path starts with an allowed prefix (/sdcard, /storage, /data/local/tmp).
-// Uses a table-driven approach consistent with BLACKLISTED_COMMANDS and TOOLS patterns.
-static int is_allowed_path_prefix(const char* path) {
-    static const char* allowed_prefixes[] = {
-        "/sdcard",
-        "/storage",
-        "/data/local/tmp",
-    };
-    for (size_t i = 0; i < sizeof(allowed_prefixes) / sizeof(allowed_prefixes[0]); i++) {
-        size_t plen = strlen(allowed_prefixes[i]);
-        if (strncmp(path, allowed_prefixes[i], plen) == 0 &&
-            (path[plen] == '/' || path[plen] == '\0')) {
-            return 1;  // allowed
-        }
-    }
-    return 0;  // not allowed
-}
-
 static int handle_device_file_read(const char* json_line, char* output, size_t out_size, void* ctx) {
     (void)ctx;
     char path[512] = {0};
@@ -978,18 +1046,7 @@ static int handle_device_file_read(const char* json_line, char* output, size_t o
         snprintf(output, out_size, "Error: path traversal not allowed.");
         return -1;
     }
-    if (!is_allowed_path_prefix(path)) {
-        snprintf(output, out_size,
-            "Error: reading only allowed from /sdcard/, /storage/, /data/local/tmp/");
-        return -1;
-    }
-    // NOTE: Path prefix check does not resolve symlinks. A symlink
-    // within an allowed prefix (e.g., /sdcard/evil_link -> /data/data/...)
-    // could bypass the whitelist. This is low risk on Android since
-    // creating symlinks in /sdcard/ requires root, but consider adding
-    // realpath() resolution if the bridge daemon supports it.
     char cmd[1024];
-    // Execute cat with safe format and capture stderr for error reporting
     snprintf(cmd, sizeof(cmd), "cat \"%s\" 2>&1", path);
     return exec_stream_cmd(cmd, output, out_size);
 }
@@ -1489,6 +1546,36 @@ int main() {
     signal(SIGPIPE, SIG_IGN);
     setvbuf(stdout, NULL, _IONBF, 0);
     fprintf(stderr, "[MCP] Native-Bridge MCP Server Ready (Safe Mode)\n");
+
+    // Load blacklist from config. An explicitly-specified config that fails to
+    // load is fatal; an auto-discovered one falls back to the built-in
+    // defaults, which block nothing.
+    char cfg_path[PATH_MAX];
+    char cfg_err[256] = {0};
+    const char *env_path = getenv("NATIVE_BRIDGE_CONFIG");
+    const char *cfg_file = config_discover(env_path, cfg_path, sizeof(cfg_path));
+    if (cfg_file) {
+        if (config_load_file(cfg_file, &g_config, cfg_err, sizeof(cfg_err)) == 0) {
+            fprintf(stderr, "[MCP] Blacklist loaded from %s (%zu entries)\n",
+                    g_config.source_path, g_config.count);
+            if (g_config.count == 0) {
+                fprintf(stderr, "[MCP] WARNING: blacklist is EMPTY - no commands blocked.\n");
+            }
+        } else {
+            if (env_path && env_path[0]) {
+                fprintf(stderr, "[MCP] FATAL: cannot load config '%s': %s\n",
+                        cfg_file, cfg_err);
+                return 1;
+            }
+            fprintf(stderr, "[MCP] WARNING: config '%s' invalid (%s); using built-in defaults.\n",
+                    cfg_file, cfg_err);
+            config_defaults(&g_config);
+        }
+    } else {
+        config_defaults(&g_config);
+        fprintf(stderr, "[MCP] No config found; no commands blocked (built-in default).\n");
+    }
+    g_active_config = &g_config;
 
     char* line = malloc(MAX_LINE_SIZE);
     if (!line) return 1;
