@@ -1,0 +1,6 @@
+{
+  "_comment": "Optional Native-Bridge MCP blacklist. Entries REPLACE the built-in default (none). An empty list blocks nothing. Copy this file to ~/.config/native-bridge/blacklist.json (chroot side) and restart nativeb_mcp. Unknown keys are ignored.",
+  "blocked_commands": [
+
+  ]
+}

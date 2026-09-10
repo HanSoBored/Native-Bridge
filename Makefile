@@ -32,10 +32,16 @@ $(BUILDDIR)/lodepng.o: $(SRCDIR)/common/lodepng.c | $(BUILDDIR)
 $(BUILDDIR)/screenshot.o: $(SRCDIR)/common/screenshot.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(BUILDDIR)/nativeb_mcp: $(SRCDIR)/main/mcp.c $(BUILDDIR)/screenshot.o $(BUILDDIR)/lodepng.o | $(BUILDDIR)
+$(BUILDDIR)/nativeb_mcp: $(SRCDIR)/main/mcp.c $(SRCDIR)/common/config.c $(BUILDDIR)/screenshot.o $(BUILDDIR)/lodepng.o | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(LDFLAGS) $^ -o $@
+
+$(BUILDDIR)/test_config: tests/test_config.c $(SRCDIR)/common/config.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $^ -o $@
+
+test: $(BUILDDIR)/test_config
+	$(BUILDDIR)/test_config
 
 clean:
 	rm -rf $(BUILDDIR)
 
-.PHONY: all clean mcp
+.PHONY: all clean mcp test
