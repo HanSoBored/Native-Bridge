@@ -5,7 +5,11 @@
 #include <unistd.h>
 #include <errno.h>
 
-#define MAX_PAYLOAD_SIZE 8192
+// Transport cap for one request/response payload (command argv or output).
+// 64KB: large agent prompts (SEND-intent prefill, long shell commands) must
+// pass through whole — the client REFUSES (loud error) instead of silently
+// truncating past this. Stack buffers sized by this are fine (64KB << 8MB).
+#define MAX_PAYLOAD_SIZE 65536
 
 typedef enum { CMD_EXEC = 1, CMD_STREAM, CMD_PING, CMD_TAP, CMD_SWIPE } CommandType;
 typedef enum { RESP_SUCCESS = 1, RESP_ERROR, RESP_STREAM_CHUNK, RESP_STREAM_END, RESP_STREAM_ERR } ResponseType;

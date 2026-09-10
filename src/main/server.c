@@ -5,6 +5,10 @@
 #include <unistd.h>
 #include <assert.h>
 #include <pthread.h>
+#include <signal.h>
+#include <errno.h>
+#include <time.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/stat.h>
@@ -24,12 +28,6 @@ typedef struct {
     pthread_mutex_t mutex;
 } ClientCtx;
 
-typedef struct {
-    ClientCtx* ctx;
-    int fd;
-    int is_stderr;
-} StreamArg;
-
 static int send_packet(ClientCtx* ctx, uint32_t type, const void* payload, uint32_t len) {
     PacketHeader hdr = {type, len};
     pthread_mutex_lock(&ctx->mutex);
@@ -37,20 +35,6 @@ static int send_packet(ClientCtx* ctx, uint32_t type, const void* payload, uint3
     if (res == 0 && len > 0) res = write_all(ctx->sock, payload, len);
     pthread_mutex_unlock(&ctx->mutex);
     return res;
-}
-
-static void* stream_reader(void* arg) {
-    StreamArg* sa = (StreamArg*)arg;
-    char buffer[4096];
-    ssize_t n;
-
-    while ((n = read(sa->fd, buffer, sizeof(buffer))) > 0) {
-        if (send_packet(sa->ctx, sa->is_stderr ? RESP_STREAM_ERR : RESP_STREAM_CHUNK, buffer, (uint32_t)n) < 0) {
-            break;  /* write failed — client connection broken */
-        }
-    }
-    close(sa->fd);
-    return NULL;
 }
 
 /* ------------------------------------------------------------------- */
@@ -125,6 +109,11 @@ static pid_t fork_exec(char** args, int argc, int close_fd,
     }
 
     if (pid == 0) {
+        /* Child: run in its own process group so the parent can kill the
+         * whole command (including "sh -c 'logcat | grep ...'" pipelines)
+         * when the client disconnects mid-stream. */
+        setpgid(0, 0);
+
         /* Child: redirect stdout and stderr to pipes */
         close(pipe_out[0]);
         if (dup2(pipe_out[1], STDOUT_FILENO) < 0) _exit(1);
@@ -153,7 +142,27 @@ static pid_t fork_exec(char** args, int argc, int close_fd,
     if (sep) close(pipe_err[1]);
     if (out_fd) *out_fd = pipe_out[0];
     if (err_fd) *err_fd = sep ? pipe_err[0] : -1;
+    /* Establish the child's process group from the parent side too, so a
+     * kill(-pid, ...) can never race the child's own setpgid(0, 0). */
+    setpgid(pid, pid);
     return pid;
+}
+
+/* Terminates a forked command's process group and reaps it. Used when the
+ * client disconnects before the command finishes (e.g. Ctrl+C during a
+ * live "logcat" stream) so no process is left running on the host.
+ * SIGTERM first, then SIGKILL after a ~2s grace period. */
+static void terminate_child_group(pid_t pid) {
+    kill(-pid, SIGTERM);
+    for (int i = 0; i < 40; i++) {
+        pid_t r = waitpid(pid, NULL, WNOHANG);
+        if (r == pid) return;
+        if (r < 0 && errno == ECHILD) return;
+        struct timespec ts = {0, 50 * 1000 * 1000};
+        nanosleep(&ts, NULL);
+    }
+    kill(-pid, SIGKILL);
+    waitpid(pid, NULL, 0);
 }
 
 /* ------------------------------------------------------------------- */
@@ -223,15 +232,38 @@ static const char* validate_logcat_exec_args(char** args, int argc) {
     return NULL;
 }
 
-/* Reads data from a pipe fd into a buffer until EOF or buffer full.
- * Returns total bytes read, or -1 on read error. */
-static ssize_t read_pipe_to_buffer(int fd, char* buf, size_t bufsize) {
+/* Reads data from a pipe fd into a buffer until EOF or buffer full,
+ * watching the client socket for disconnect so a Ctrl+C mid-command
+ * doesn't leave the child running on the host.
+ * Returns total bytes read, or -1 if the client disconnected. */
+static ssize_t read_pipe_to_buffer(int fd, int client_sock,
+                                   char* buf, size_t bufsize) {
     ssize_t total = 0;
-    ssize_t n;
-    while (total < (ssize_t)bufsize - 1 &&
-           (n = read(fd, buf + total, bufsize - (size_t)total - 1)) > 0)
-        total += n;
-    return (n < 0) ? -1 : total;
+    struct pollfd fds[2] = {{client_sock, POLLIN, 0}, {fd, POLLIN, 0}};
+
+    while (total < (ssize_t)bufsize - 1) {
+        int rc = poll(fds, 2, -1);
+        if (rc < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (fds[0].revents & (POLLIN | POLLHUP | POLLERR)) {
+            char discard[64];
+            while (read(client_sock, discard, sizeof(discard)) > 0) {}
+            return -1;  /* client disconnected */
+        }
+        if (!(fds[1].revents & (POLLIN | POLLHUP | POLLERR))) continue;
+
+        ssize_t n = read(fd, buf + total, bufsize - (size_t)total - 1);
+        if (n > 0) {
+            total += n;
+        } else if (n == 0) {
+            break;  /* EOF */
+        } else if (errno != EINTR && errno != EAGAIN) {
+            break;  /* read error */
+        }
+    }
+    return total;
 }
 
 static int handle_client_exec(ClientCtx* ctx, char* payload, uint32_t len) {
@@ -254,26 +286,31 @@ static int handle_client_exec(ClientCtx* ctx, char* payload, uint32_t len) {
         return send_packet(ctx, RESP_ERROR, err, (uint32_t)err_len);
     }
 
-    char* out = calloc(1, 8192);
+    char* out = calloc(1, MAX_PAYLOAD_SIZE);
     if (!out) {
         char* err = "Out of memory reading command output";
         size_t err_len = strlen(err);
         close(out_fd);
         return send_packet(ctx, RESP_ERROR, err, (uint32_t)err_len);
     }
-    ssize_t total = read_pipe_to_buffer(out_fd, out, 8192);
+    ssize_t total = read_pipe_to_buffer(out_fd, ctx->sock, out, MAX_PAYLOAD_SIZE);
     close(out_fd);
-    if (total < 0) total = 0;
-    /* Warn if output may have been truncated (buffer full at 8191 bytes) */
-    if (total == 8191) {
+    if (total < 0) {
+        /* Client disconnected: kill the child and report nothing. */
+        terminate_child_group(pid);
+        free(out);
+        return -1;
+    }
+    /* Warn if output may have been truncated (buffer full at MAX-1 bytes) */
+    if (total == MAX_PAYLOAD_SIZE - 1) {
         fprintf(stderr, "Warning: command output possibly truncated "
-                        "(%zd bytes, 8KB buffer limit)\n", total);
+                        "(%zd bytes, %d buffer limit)\n", total, MAX_PAYLOAD_SIZE);
     }
 
     int status;
     waitpid(pid, &status, 0);
-    /* total is always <= 8192: read_pipe_to_buffer clamps at bufsize-1 */
-    assert(total >= 0 && total < 8192);
+    /* total is always <= MAX_PAYLOAD_SIZE: read_pipe_to_buffer clamps at bufsize-1 */
+    assert(total >= 0 && total < MAX_PAYLOAD_SIZE);
     int ret;
     if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
         ret = send_packet(ctx, RESP_SUCCESS, out, (uint32_t)total);
@@ -301,18 +338,72 @@ static int handle_client_stream(ClientCtx* ctx, char* payload, uint32_t len) {
         return send_packet(ctx, RESP_ERROR, err, (uint32_t)err_len);
     }
 
-    pthread_t t1, t2;
-    StreamArg arg_out = {ctx, out_fd, 0};
-    StreamArg arg_err = {ctx, err_fd, 1};
+    /* Poll the client socket alongside the output pipes so a client
+     * disconnect (Ctrl+C, closed socket) terminates the child instead of
+     * leaving e.g. "logcat" running on the host until it happens to get
+     * SIGPIPE — which may never happen on a quiet device. */
+    struct pollfd fds[3] = {
+        {ctx->sock, POLLIN, 0},
+        {out_fd, POLLIN, 0},
+        {err_fd, POLLIN, 0},
+    };
+    int client_open = 1;
+    int out_open = 1;
+    int err_open = 1;
+    int send_failed = 0;
+    char buffer[4096];
 
-    if (pthread_create(&t1, NULL, stream_reader, &arg_out) != 0) {
-        close(out_fd); close(err_fd); return -1;
+    while (out_open || err_open) {
+        fds[0].events = (short)(client_open ? POLLIN : 0);
+        fds[1].events = (short)(out_open ? POLLIN : 0);
+        fds[2].events = (short)(err_open ? POLLIN : 0);
+
+        int rc = poll(fds, 3, -1);
+        if (rc < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+
+        /* Client connection closed: stop forwarding and kill the child. */
+        if (client_open && (fds[0].revents & (POLLIN | POLLHUP | POLLERR))) {
+            char discard[64];
+            while (read(ctx->sock, discard, sizeof(discard)) > 0) {}
+            client_open = 0;
+            break;
+        }
+
+        for (int i = 1; i <= 2; i++) {
+            int* open_flag = (i == 1) ? &out_open : &err_open;
+            if (!*open_flag || !(fds[i].revents & (POLLIN | POLLHUP | POLLERR)))
+                continue;
+
+            ssize_t n = read(fds[i].fd, buffer, sizeof(buffer));
+            if (n > 0) {
+                uint32_t ptype = (i == 1) ? RESP_STREAM_CHUNK : RESP_STREAM_ERR;
+                if (send_packet(ctx, ptype, buffer, (uint32_t)n) < 0) {
+                    send_failed = 1;
+                    client_open = 0;
+                    break;
+                }
+            } else if (n == 0) {
+                *open_flag = 0;
+                close(fds[i].fd);
+            } else if (errno != EINTR && errno != EAGAIN) {
+                *open_flag = 0;
+                close(fds[i].fd);
+            }
+        }
+        if (send_failed) break;
     }
-    if (pthread_create(&t2, NULL, stream_reader, &arg_err) != 0) {
-        close(out_fd); pthread_join(t1, NULL);
-        close(err_fd); return -1;
+
+    if (out_open) close(out_fd);
+    if (err_open) close(err_fd);
+
+    /* Client went away: make sure the child process group is dead. */
+    if (!client_open) {
+        terminate_child_group(pid);
+        return 0;
     }
-    pthread_join(t1, NULL); pthread_join(t2, NULL);
 
     int status;
     waitpid(pid, &status, 0);

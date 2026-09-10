@@ -63,7 +63,11 @@ int main(int argc, char *argv[]) {
         hdr.type = (strcmp(argv[1], "-e") == 0) ? CMD_EXEC : CMD_STREAM;
         for (int i = 2; i < argc; i++) {
             size_t len = strlen(argv[i]);
-            if (hdr.len + len + 1 > sizeof(payload)) break;
+            if (hdr.len + len + 1 > sizeof(payload)) {
+                fprintf(stderr, "FATAL: command exceeds %zu-byte transport limit (%u bytes) — refusing to send truncated command.\n",
+                        sizeof(payload), hdr.len + (uint32_t)len + 1);
+                return 1;
+            }
             strcpy(payload + hdr.len, argv[i]);
             hdr.len += (uint32_t)(len + 1);
         }
